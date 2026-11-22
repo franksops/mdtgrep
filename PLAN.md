@@ -1,57 +1,89 @@
-## REQUIREMENT
+# MDTGrep — product brief
 
-https://www.sierrachart.com/index.php?page=doc/AdvancedCustomStudyInterfaceAndLanguage.php
+## Purpose
 
-https://github.com/power-shift/sierrachart-acsil-docs
+Give a trading research and automation stack a clean, validated market data feed out of Sierra
+Chart: bars and trade records, in true UTC, keyed by the exchange trading day, ready to backtest
+on and to train an execution bot against.
 
-ACSIL study, add to chart, uses chart settings (bar period, range of time, or specific contract name) to download tick data for future analysis, strategy backtesting, algo-bot training.
- 
-(Time) Back-adjusted - Best for price-based strategies — eliminates roll gaps, levels are continuous
- 
-    Chart Settings → Bar Period
-    1 minute / 60 secondS
+The consumer is the SC-Assist pipeline — a strategy research, backtesting and execution system
+that needs the same data at every stage, so that a strategy researched on historical bars behaves
+identically when it is traded live.
 
-    unix_ts, open, high, low, close, volume, ask_vol, bid_vol, num_trades, open_interest
+## Scope
 
-(Tick)No adjustment- Best for volume/delta/profile work — actual traded prices preserved
+Two modes, one dataset:
 
-    Chart Settings → Bar Period
-    Number ofTrades Per Bar / 1
+**Bars — back adjusted.** For price based strategies, where a continuous series matters more than
+the individual contract.
 
-    unix_ts_ms, price, volume, ask_vol, bid_vol, delta, num_trades
+```
+Chart Settings → Bar Period → 1 minute
 
-## STATUS
+unix_ts_ms, trading_day, open, high, low, close,
+volume, ask_vol, bid_vol, num_trades, open_interest
+```
 
-**Implemented** — `MDTGrep.cpp`, see README.md for the full instructions.
+**Trades — raw.** For volume, delta and execution research, where the traded prices have to be
+the real ones.
 
-*   Bar export — chart bars with a Unix epoch millisecond timestamp, the buy/sell volume split and
-    the trade count.
-*   Tick export — the underlying intraday trade records with price, volume, aggressor volume,
-    delta, trade count, side and the bid/ask of the moment.
-*   Timestamps in true UTC. Sierra Chart keeps chart bars in the chart time zone and intraday file
-    records in UTC; both are converted so the two files always agree.
-*   `open_interest` is only valid for daily and higher timeframe charts. Sierra returns the trade
-    count in that array for intraday charts, so intraday exports write `0`.
-*   Chart settings that produce a complete, DST correct export are documented in the README
-    (1 minute bars, chart time zone UTC, 24 hour session, date range one day wider on each side).
+```
+Chart Settings → Bar Period → Number of Trades Per Bar → 1
 
-**Verified** — the bar exports of `ESZ16`, `ESH17` and `ESM17` (262,552 bars, Sept 2016 – Jun 2017)
-were checked bar for bar against the original export: zero value differences, zero OHLC violations,
-the session structure and the market holidays/halt/maintenance breaks correct across both daylight
-saving transitions, and the session closes tracking the front month contract to within ~1 point.
+unix_ts_ms, trading_day, price, volume, ask_vol, bid_vol,
+delta, num_trades, side, bid, ask
+```
 
-**Open**
+## Deliverables
 
-*   Tick export vs Databento — the trade level export still has to be compared against a Databento
-    `trades` file to establish the real match rate (`tools/verify_vs_databento.py`).
-*   Storage granularity — the export is only trade level when the intraday data storage time unit
-    is 1 Tick and the data has been re-downloaded after that setting was changed. The `num_trades`
-    column of the tick file reports it.
-*   Known source data gap — the intraday data of `ESM17` is missing the first 71 minutes of the
-    2017-06-04 session. This is a gap in Sierra's data and is present in every export of that
-    contract.
+| | |
+|---|---|
+| `MDTGrep.cpp` | The ACSIL study: exports the chart and its trade records with the exchange trading day, in UTC, with a metadata sidecar per file |
+| `tools/build_parquet.py` | The ingest: schema normalisation, validation, session and gap derivation, partitioned Parquet |
+| `tools/init_duckdb.py` | The catalogue: instruments, sessions, gaps, rolls, exports, calendar, and the views over the lake |
+| `tools/validate_export.py` | Structural validation of any export |
+| `tools/verify_vs_databento.py` | Trade level comparison against another vendor |
+| `tools/cme_calendar.py` | The CME equity index holiday and early close calendar |
+| `docs/SPEC.md` | The technical specification of the data lake |
 
-## FUTURE ENHANCEMENTS
+## Principles
 
-* **Parquet Export**: Eventually transition from CSV to Apache Parquet format. Given that a few years of tick data can amount to 30+ GB, Parquet's columnar storage and efficient compression will significantly reduce file sizes and improve read performance for subsequent analysis and backtesting.
-* **Incremental export**: Append session by session instead of re-exporting the whole history.
+1. **Raw and adjusted stay separate.** The trade file always carries raw traded prices; the bar
+   file follows the chart's back adjustment. A continuous series is derived at load time.
+2. **The session key is computed.** The CME session opens at 18:00 and closes at 17:00 Eastern, so
+   the evening bars belong to the next trading day — and that rule moves with daylight saving time.
+3. **Nothing is filled in.** A missing minute stays missing and is reported. A backtest that
+   trades through a hole in the feed is worse than one that skips it.
+4. **Provenance is part of the data.** The chart settings that produced a file are recorded with
+   it, so a collection of dozens of contracts can be audited after the fact.
+
+## Status
+
+**Shipped.**
+
+*   The study exports bars and trade records with the exchange trading day, in UTC, with a
+    metadata sidecar per file.
+*   The ingest validates every file against the market structure and writes partitioned Parquet;
+    it is idempotent and never holds duplicates.
+*   The catalogue serves the lake through DuckDB: sessions, gaps, instruments, the trading
+    calendar and the roll spreads.
+*   The reference dataset — `ESZ16`, `ESH17`, `ESM17`, 262,552 bars, September 2016 to June 2017 —
+    is verified end to end: every bar reproduced exactly, correct session structure across both
+    daylight saving transitions, no unexplained gaps.
+*   One gap in the feed is known and reported: ESM17 is missing the first 71 minutes of the
+    2017-06-04 session.
+
+**Open.**
+
+*   The trade level export has not yet been compared against Databento. The comparison tool is in
+    place; the measurement is the next step.
+*   Tick level history is only available where the data service provides it. The `num_trades`
+    column reports the granularity per row.
+
+## Roadmap
+
+*   Incremental collection, so a long history can be built session by session instead of in one
+    pass.
+*   A continuous-series builder driven by the `rolls` table, so a price based strategy can be
+    researched on a continuous series without exporting adjusted charts.
+*   More instruments in the contract catalogue.

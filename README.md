@@ -1,25 +1,56 @@
-# MDTGrep (Market Data Tick Grep)
+# MDTGrep
 
-MDTGrep is an Advanced Custom Study Interface and Language (ACSIL) DLL for Sierra Chart.
+**Market data extraction for Sierra Chart, built for backtesting and algorithmic trading.**
 
-It extracts the data of the chart it is added to into flat CSV files for Pandas/Polars, a database
-loader, or the SC-Assist pipeline. Both **chart bars** and the **underlying intraday trade records
-(ticks)** can be exported, with timestamps in true UTC so the output joins cleanly with Databento
-and other sources.
+MDTGrep turns a Sierra Chart into a data feed you can actually backtest on. It exports the bars
+*and* the underlying trade records of any chart to CSV in true UTC, stamps every row with the
+exchange trading day, and ships a pipeline that validates the result, stores it as Parquet and
+serves it through DuckDB.
 
 ---
 
-## Quick start — the verified recipe
+## What you get
 
-### 1. Build the study
+| | |
+|---|---|
+| **Bars** | OHLC, volume, the buy/sell volume split and the trade count of every minute of the chart |
+| **Trades** | The individual trade records behind the bars: price, size, aggressor side, delta and the quotes of the moment |
+| **True UTC timestamps** | Every row is a UTC instant, so the data joins cleanly with Databento, crypto or equity feeds |
+| **Exchange trading day** | The session key on every row, correct across daylight saving transitions |
+| **Provenance** | A metadata sidecar per export recording the settings that produced it |
+| **Validation** | Every file is checked against the market structure before it enters the lake |
+| **A queryable lake** | Partitioned Parquet with a DuckDB catalogue: sessions, gaps, instruments, calendar and roll spreads |
+
+Three design decisions shape everything else:
+
+1. **Raw and adjusted stay separate.** The trade file always contains raw traded prices. The bar
+   file follows the chart's back adjustment. A continuous series is derived at load time, never
+   baked into the source.
+2. **The session key is computed, not assumed.** The CME session opens at 18:00 and closes at 17:00
+   Eastern, so the evening bars belong to the *next* trading day — and that rule shifts with
+   daylight saving time.
+3. **Nothing is filled in.** A missing minute stays missing and is reported. Inventing a bar for a
+   hole in the feed is how a backtest ends up trading on data that never existed.
+
+---
+
+## Install
 
 1.  Copy `MDTGrep.cpp` to `C:\SierraChart\ACS_Source\`.
-2.  Sierra Chart → `Analysis` → `Build Custom Studies DLL` → check `MDTGrep.cpp` → **Build Remote**.
-3.  **Restart Sierra Chart**, then remove and re-add the study to the chart.
+2.  In Sierra Chart: `Analysis` → `Build Custom Studies DLL` → check `MDTGrep.cpp` → **Build Remote**.
+3.  Restart Sierra Chart, then add the study to a chart.
 
-> Always use **Build Remote**. See [Build and the interface version](#build-and-the-interface-version).
+**Build Remote** compiles against the header of the Sierra Chart build you are running. A local
+build uses whatever `ACS_Source\sierrachart.h` happens to be, and Sierra Chart rejects a DLL whose
+ACSIL interface version does not match its own — silently, and without a compile error. MDTGrep
+reports the interface version it was built with on every export and warns at compile time when the
+header is too old.
 
-### 2. Chart settings (per symbol)
+---
+
+## Quick start
+
+### 1. Chart settings
 
 `Chart` → `Chart Settings`:
 
@@ -30,11 +61,17 @@ and other sources.
 | Session Times | `Session Times` | Start **00:00:00**, End **23:59:59** |
 | Date range | `Use Date Range` | From = contract open **−1 day**, To = contract close **+1 day** |
 
-The bar period is **1 minute for both exports**. The tick export reads the intraday data files
-directly, so the bar period only controls how those records are iterated — it does not change the
-output. Do **not** use `Range Per Bar` here: that produces price-movement bars, not time bars.
+The 24 hour session is deliberate: session times are wall clock times *in the chart's time zone*,
+and a fixed UTC session cannot follow the exchange across a daylight saving change. Nothing is
+ever outside a 24 hour session, so no bar can be dropped or shifted in either half of the year.
 
-### 3. Study settings
+The date range is a day wider on each side so the first and the last session of the contract are
+charted completely — a futures contract's data starts in the evening, not at midnight.
+
+The bar period is **1 minute for both exports**. The trade export reads the intraday data files
+directly, so the bar period controls only how those records are iterated.
+
+### 2. Study settings
 
 `Studies` → `MDT Grep (CSV Exporter)` → `Study Settings`:
 
@@ -45,122 +82,77 @@ output. Do **not** use `Range Per Bar` here: that produces price-movement bars, 
 | 2 | Export Mode | `Bars` first, then `Ticks` |
 | 3 | Output Directory | `C:\SierraChart\SCAssistData\` |
 | 4 | Timestamp Basis | **UTC** |
-| 5 | Max Bars For Tick Export | `1400` (one session) for the first tick run |
+| 5 | Max Bars For Tick Export | `1400` (one session) for the first trade run |
 
-### 4. Export
+### 3. Export
 
-`Edit` → `Recalculate` on the chart. The log confirms what happened:
+`Edit` → `Recalculate` on the chart. The log confirms the result:
 
 ```
-MDTGrep: ACSIL interface 2969 - exported 90619 bars to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars.csv (chart local time)
-MDTGrep: ACSIL interface 2969 - exported 240318 ticks to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars_ticks.csv (chart local time)
+MDTGrep: ACSIL interface 2969 - exported 90619 bars to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars.csv (UTC)
 ```
 
-### 5. Verify
+### 4. Validate and load
 
 ```bash
-python tools/validate_export.py ESZ16_FUT_CME_bars.csv
-python tools/verify_vs_databento.py --sierra ESZ16_FUT_CME_bars_ticks.csv --databento esz16.parquet
+python tools/validate_export.py market_data/bars_1m/ESZ16_FUT_CME_bars.csv
+python tools/build_parquet.py --source market_data --out data/parquet --reports data/reports
+python tools/init_duckdb.py --parquet data/parquet --tables data/tables --db data/market.duckdb
+```
+
+### 5. Query
+
+```sql
+-- duckdb data/market.duckdb
+SELECT symbol, trading_day, bars, volume, close
+FROM bars_1m_by_day
+WHERE symbol = 'ESZ16_FUT_CME' AND trading_day BETWEEN '2016-12-01' AND '2016-12-31';
+
+SELECT * FROM data_gaps;
 ```
 
 ---
 
-## Build and the interface version
+## Output
 
-The `SCDLLName` macro exports `scdll_DLLVersion()`, which returns the ACSIL interface version the
-DLL was compiled against. Sierra Chart compares it against the interface version of the running
-build and **silently refuses to run a study whose DLL does not match**:
-
-> The study ... needs to be recompiled for this version of Sierra Chart.
-
-That is why a study built against a stale `ACS_Source\sierrachart.h` compiles with **zero errors**
-and still never runs. The rules:
-
-*   The interface version tracks the Sierra Chart build that introduced the change, so it has to
-    match the running build. Sierra Chart **2972 and higher** finalized the internal double
-    precision number project, which is why every custom study has to be recompiled for that
-    version. A build made against an older header reports the older version (`SC_DLL_VERSION` in
-    `sierrachart.h`) and is rejected.
-*   **Build Remote** always compiles against the header of the running Sierra Chart build. A local
-    build uses whatever `ACS_Source\sierrachart.h` happens to be.
-*   MDTGrep logs the interface version it was built with on every export. **If that line is missing
-    from the log, the study function never ran** — the DLL was not loaded.
-*   A freshly built DLL is only picked up after Sierra Chart is restarted (or after the study is
-    removed and re-added), and the export has to be triggered with `Edit → Recalculate`.
-
-MDTGrep also emits a `#pragma message` at compile time when it is built against an interface older
-than `2969`, so a stale local build is visible in the build log.
-
----
-
-## Study inputs
-
-| # | Input | Default | Description |
-|---|-------|---------|-------------|
-| 0 | Trigger Export on Full Recalc | Yes | Export on every full recalculation of the chart (chart load, bar period change, date range change). |
-| 1 | Export File Suffix | `_bars` | Suffix of the output file, e.g. `_bars`, `_1min`, `_5min`. |
-| 2 | Export Mode | Bars | `Bars` = chart bars, `Ticks` = underlying intraday trade records, `Both`. |
-| 3 | Output Directory | `C:\SierraChart\SCAssistData\` | Directory the CSV files are written to. Created if it does not exist. |
-| 4 | Timestamp Basis | Chart Local (as-is) | `Chart Local` keeps the chart/exchange local time, `UTC` converts it. |
-| 5 | Max Bars For Tick Export | 0 (all) | Limits how many chart bars are read for the tick export. |
-
-Changing any of these settings re-runs the export immediately — an input change does not cause a
-full recalculation, and the study watches for setting changes itself.
-
----
-
-## Generated files
-
-Output directory (input #3), default `C:\SierraChart\SCAssistData\`:
-
-| Mode | File | Example |
-|------|------|---------|
-| Bars | `<SYMBOL><suffix>.csv` | `ESM17_FUT_CME_bars.csv` |
-| Ticks | `<SYMBOL><suffix>_ticks.csv` | `ESM17_FUT_CME_bars_ticks.csv` |
-
-### Bars
+### Bars — `<SYMBOL><suffix>.csv`
 
 ```
 unix_ts_ms,trading_day,open,high,low,close,volume,ask_vol,bid_vol,num_trades,open_interest
 1795278600000,2026-11-23,5321.00,5321.75,5321.00,5321.50,154,82,72,98,0
 ```
 
-*   `unix_ts_ms` — Unix epoch milliseconds, start of the chart bar.
-*   `trading_day` — the **exchange trading day** (`YYYY-MM-DD`) the bar belongs to. The CME session
-    opens at 18:00 and closes at 17:00 Eastern, so the evening bars carry the *next* day's label.
-    This is the session key for grouping, joining and gap detection, and it is computed with the
-    daylight saving rules so it stays correct over the whole history.
-*   `open, high, low, close` — prices. These follow the **back adjustment settings of the chart**.
-*   `volume, ask_vol, bid_vol, num_trades` — integers. `ask_vol`/`bid_vol` are the traded-at-ask /
-    traded-at-bid volumes, i.e. the buy/sell split.
-*   `open_interest` — only valid for daily and higher timeframe charts. Sierra Chart returns the
-    *trade count* in that array for intraday charts, so MDTGrep writes `0` for intraday charts
-    instead of duplicating `num_trades`.
+| Column | |
+|---|---|
+| `unix_ts_ms` | UTC epoch milliseconds, start of the bar |
+| `trading_day` | The exchange trading day (`YYYY-MM-DD`). The CME session opens at 18:00 Eastern, so the evening bars carry the next day's label |
+| `open` `high` `low` `close` | Prices, following the chart's back adjustment settings |
+| `volume` | Contracts traded |
+| `ask_vol` | Contracts bought at the ask (aggressive buys) |
+| `bid_vol` | Contracts sold at the bid (aggressive sells) |
+| `num_trades` | Individual trades in the bar |
+| `open_interest` | Always `0` for intraday charts — Sierra Chart only provides open interest for daily and higher timeframes, and returns the trade count there instead |
 
-### Ticks
+### Trades — `<SYMBOL><suffix>_ticks.csv`
 
 ```
 unix_ts_ms,trading_day,price,volume,ask_vol,bid_vol,delta,num_trades,side,bid,ask
 1795278602150,2026-11-23,5321.25,2,2,0,2,1,B,5321.00,5321.25
-1795278602300,2026-11-23,5321.00,5,0,5,-5,2,S,5321.00,5321.25
 ```
 
-*   `unix_ts_ms` — Unix epoch milliseconds of the trade.
-*   `trading_day` — the exchange trading day of the trade, same rule as the bar export.
-*   `price` — traded price (raw, not back adjusted).
-*   `volume, ask_vol, bid_vol` — trade volume and its buy/sell split.
-*   `delta` — `ask_vol - bid_vol`.
-*   `num_trades` — number of trades in the record. **Values greater than 1 mean the record
-    aggregates several trades**, i.e. the intraday storage time unit is not 1 Tick for that data.
-*   `side` — `B` (buy), `S` (sell) or `N` (unknown/mixed). Derived with the same rule the
-    exchanges use: a trade at or above the ask is a buy, a trade at or below the bid is a sell.
-    When the record does not carry the quotes the side falls back to the buy/sell volume split.
-*   `bid, ask` — the bid and ask prices of the moment of the trade. Only present when the data
-    service supplied the quotes with the trade, otherwise `0`.
+| Column | |
+|---|---|
+| `unix_ts_ms` | UTC epoch milliseconds of the trade |
+| `trading_day` | The exchange trading day of the trade |
+| `price` | The traded price, raw |
+| `volume` | The traded size |
+| `ask_vol` `bid_vol` | The buy and sell aggressor volume |
+| `delta` | `ask_vol - bid_vol` |
+| `num_trades` | Trades in the record — `1` on a 1 Tick record, more when the record aggregates |
+| `side` | `B`, `S` or `N`. A trade at or above the ask is a buy, at or below the bid a sell; the exchange rule when the record carries the quotes, otherwise the volume split |
+| `bid` `ask` | The quotes at the moment of the trade, `0` when the feed did not supply them |
 
-### Metadata sidecar
-
-Every export also writes `<file>_meta.csv` next to the data file:
+### Metadata sidecar — `<file>_meta.csv`
 
 ```
 key,value
@@ -181,146 +173,10 @@ last_trading_day,2017-03-15
 exported_at_utc,2026-11-22 15:25:33
 ```
 
-It records the settings that produced the file. The chart time zone and the session times are not
-visible in the data itself, so they have to be captured when the file is written — without this a
-collection of 40+ contracts cannot be audited after the fact. `is_range_bars` is 1 when the chart
-was set to a price-movement bar period, which produces bars that are not time based.
-
-`timestamps_are_utc` is the row the load pipeline should assert on: it is 1 when the timestamps in
-the file are true UTC instants, which is the case when `Timestamp Basis` is `UTC` or when the
-chart time zone is UTC. The study logs a warning when it is 0.
-
----
-
-## Getting tick data
-
-The tick export reads the intraday data files (`.scid`) of the chart, one record at a time. It
-needs:
-
-1.  An **intraday chart**. Daily charts have no intraday records.
-2.  `Global Settings` → `Data/Trade Service Settings` → `Common Settings` → **Intraday Data Storage
-    Time Unit** = **1 Tick**.
-3.  The intraday data **re-downloaded** after that setting was changed:
-    `Edit` → `Delete and Download Data` on an intraday chart per symbol. The setting only affects
-    data collected or downloaded *afterwards*; existing `.scid` files keep their old granularity.
-    (The built-in **Numbers Bars** study can switch the setting to 1 Tick automatically with its
-    *"Require 1 Tick Intraday Data Storage Time"* input.)
-
-> **Reading every tick of a long history makes the Sierra Chart user interface freeze for a while.**
-> Sierra documents this limitation of `sc.ReadIntradayFileRecordForBarIndexAndSubIndex()`. Use
-> `Max Bars For Tick Export`, or export day by day, until the pipeline is proven.
-
-### Reading the `num_trades` column
-
-This single column tells you whether the storage granularity is right:
-
-| `num_trades` | Meaning | Action |
-|--------------|---------|--------|
-| `1` on ~every row | 1 Tick storage, one record per trade | ✅ This is the trade level feed — compare it against Databento. |
-| ~160 (or any value > 1) | the records are batches of trades | Set the storage unit to 1 Tick, re-download the intraday data, export again. |
-
-A quick visual check without exporting: open the **Time and Sales** window on the chart. One line
-per trade with millisecond timestamps means 1 Tick storage; one aggregated line per bucket means
-the storage is still coarse.
-
----
-
-## Timestamps
-
-Sierra Chart uses two different time bases internally and MDTGrep converts both into the basis you
-select, so the bar file and the tick file always agree:
-
-| Source | Time base in Sierra Chart | Conversion used |
-|--------|---------------------------|-----------------|
-| `sc.BaseDateTimeIn[]` (chart bars) | already adjusted to the **time zone of the chart** | chart time zone → UTC |
-| Intraday `.scid` records (ticks) | **UTC/GMT** (raw storage format) | UTC → chart time zone |
-
-`Timestamp Basis` selects the result:
-
-*   `Chart Local (as-is)` — the exchange/chart local time.
-*   `UTC` — required for a direct comparison with Databento, whose timestamps are UTC.
-
-Set `Timestamp Basis` to **UTC** when comparing against Databento.
-
----
-
-## Chart settings that matter, and why
-
-### The chart time zone and the session times
-
-The chart **Session Times** are wall clock times **in the time zone of the chart**. The CME equity
-index session opens at 18:00 and closes at 17:00 Eastern, which is **23:00 → 22:00 UTC in winter
-and 22:00 → 21:00 UTC in summer**.
-
-A fixed UTC session can therefore only be correct for one of the two daylight saving halves, and
-when Sierra Chart shifts the session times for a time zone change it uses the offset that is in
-effect *at that moment* — so a chart that is right for the summer data ends up an hour off for that
-period. The bars of the first hour of every affected session are then labelled an hour late or
-dropped.
-
-The **24 hour session** (`00:00:00` – `23:59:59`) avoids this entirely: nothing is ever outside
-the session, so no bar can be dropped or shifted in any daylight saving period. Sierra documents
-this as the way to include all 24 hours of data.
-
-The alternative is to leave the chart on Eastern (or the exchange time zone) with the session times
-at **18:00:00 – 17:59:59** and let the study do the DST aware conversion with
-`Timestamp Basis = UTC`. Eastern and Central share the US daylight saving rules, so the session
-follows the exchange all year.
-
-### The first session of the chart
-
-With a 24 hour session the first session day starts at 00:00, but a futures contract's intraday
-data starts at the evening session open. If the chart's first day is the day the data starts on,
-that partial session can end up not charted at all — typically the opening hour, which contains the
-highest volume burst of the file.
-
-**Start the chart date range one day before the contract opens.** The incomplete session day then
-falls on a day with no data and nothing is lost. Add a day after the contract closes for the same
-reason at the other end.
-
----
-
-## Pitfalls
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Build reports no errors, no CSV appears | DLL built against an old `sierrachart.h`, rejected by Sierra Chart at runtime | Build **Remote**, restart Sierra Chart, re-add the study. Look for the `MDTGrep: ACSIL interface ...` log line. |
-| Study settings show only 2 inputs | The old DLL is still loaded | Rebuild + restart + re-add the study. The new one has 6 inputs. |
-| Timestamps are 4–5 h behind UTC | The chart time zone is Eastern and `Timestamp Basis` is `Chart Local` | Set `Timestamp Basis` to `UTC`, or set the chart time zone to UTC. |
-| First hour of every summer session missing or shifted an hour | Fixed UTC session times vs. the exchange daylight saving change | Use the 24 hour session (recommended) or Eastern + `Timestamp Basis = UTC`. |
-| First session of the file is missing | The chart's first day is the day the data starts on | Extend the date range one day earlier. |
-| Bars have ragged, unaligned durations and ~160 trades each | The bar period is `Range Per Bar` (a price movement bar) | Use `Days-Mins-Secs-Milliseconds Per Bar` = 1 minute. |
-| Tick file rows contain many trades | Intraday storage is coarser than 1 Tick | Set `Intraday Data Storage Time Unit` = 1 Tick **and re-download** the intraday data. |
-| Tick export is very slow / Sierra freezes | Every tick of a long history is being read | Use `Max Bars For Tick Export`, or export day by day. |
-| `open_interest` equals `num_trades` | Sierra returns the trade count in that array for intraday charts | Expected. MDTGrep writes `0` for intraday charts. |
-
----
-
-## Fidelity compared to Databento
-
-Databento `trades` and an MDTGrep tick export come from the same exchange feed when using Sierra's
-Teton service (CME MDP 3.0), so prices and sizes should line up trade for trade. What remains
-different:
-
-| Aspect | Databento | MDTGrep / Sierra Chart | Impact on a backtest |
-|--------|-----------|------------------------|-----------------------|
-| Timestamp | UTC, nanoseconds | UTC, milliseconds (Sierra resolution) | Sub-millisecond ordering is lost. The export keeps the file order, so the sequence is still correct. |
-| Price | raw traded price | raw traded price | none (the **bar** file is chart back adjusted, the tick file is not) |
-| Size | integer | integer | none |
-| Side | exchange reported (`B`/`S`/`N`) | derived from the quotes of the trade, otherwise from the buy/sell volume split | Mid-tick trades can be `N` in Sierra and `B`/`S` in Databento. |
-| Cancels / corrections | `action` = `C` / `X` | not provided by the data service | Databento can contain fewer trades than Sierra for the same session. |
-| Book depth (MBP-1 / MBO) | up to 10 price levels | not available | Depth based strategies cannot be reproduced from this export. |
-| Aggregation | one message per trade | one record per trade, but only when the intraday storage time unit is 1 Tick | Check the `num_trades` column: values `> 1` are aggregated records. |
-
-### Acceptance criteria for a tick export
-
-| Metric | Target |
-|--------|--------|
-| Price match (exact) | ≥ 99.5% |
-| Volume match | ≥ 99% |
-| Timestamps matched within ±1 ms | ≥ 99.9% |
-| Unmatched Sierra trades | < 0.5% |
-| Side agreement (`B`/`S`) | ≥ 95% |
+The chart's time zone and session times are invisible in the data itself, so the sidecar records
+them when the file is written — that is what makes a collection of dozens of contracts auditable
+after the fact. `timestamps_are_utc` is the assertion the pipeline makes, and `is_range_bars`
+flags a chart that was set to a price-movement bar period, which does not produce time based bars.
 
 ---
 
@@ -328,247 +184,219 @@ different:
 
 The exports are the immutable landing zone; everything else is derived from them.
 
+```
+Sierra Chart ──▶ CSV landing zone ──▶ validated Parquet ──▶ DuckDB
+                  (never edited)        (partitioned)        (queried in place)
+```
+
 ```bash
-# 1  ingest: CSV -> validated Parquet (idempotent, one run per changed file)
+# ingest: CSV -> validated Parquet, idempotent
 python tools/build_parquet.py --source market_data --out data/parquet --reports data/reports
 
-# 2  the catalogue: sessions, gaps, instruments, calendar and the views
+# catalogue: sessions, gaps, instruments, calendar, and the views over the lake
 python tools/init_duckdb.py --parquet data/parquet --tables data/tables \
     --reports data/reports --db data/market.duckdb
 ```
 
-Then query it:
+**The ingest** reads every export, normalises the schema (deriving `trading_day` for exports made
+before the column existed), validates the invariants, derives the session and gap tables and
+writes partitioned Parquet (`symbol=/year=`, zstd, 500k row groups). It is idempotent — a source
+file is fingerprinted and skipped when it has not changed — and when the same series exists more
+than once, the newest export wins.
 
-```sql
--- duckdb data/market.duckdb
-SELECT symbol, trading_day, bars, volume, close FROM bars_1m_by_day
-WHERE symbol = 'ESZ16_FUT_CME' AND trading_day BETWEEN '2016-12-01' AND '2016-12-31';
+**The catalogue** holds what the rows cannot say:
 
-SELECT * FROM data_gaps;
-```
+| Table | |
+|---|---|
+| `instruments` | Contract specifications: expiry, first notice, multiplier, tick size, currency |
+| `sessions` | One row per symbol and trading day: open, close, bars, volume, session kind |
+| `data_gaps` | The holes in the feed, with the minutes missing |
+| `rolls` | The calendar spread between two contracts, for building a continuous series |
+| `exports` | Provenance: every file, its settings, its row count and its export time |
+| `trading_calendar` | The CME holiday and early close calendar |
+| `file_reports` | The validation result of every file |
 
-The ingest validates every file and writes a JSON report; it exits non-zero when a rule fails.
-The rules, the schema, the calendar model and the backtest caveats are in
-**[docs/SPEC.md](docs/SPEC.md)**.
+| View | |
+|---|---|
+| `bars_1m` / `trades` | Every row |
+| `bars_1m_by_day` / `trades_by_day` | One row per symbol and trading day |
 
-## Tools
+The bulk data is never copied into the database — DuckDB reads the Parquet files directly, with
+column and row group pruning.
 
-All tools are plain Python with `pandas`, `pyarrow` and `duckdb`
-(`pip install pandas pyarrow duckdb`).
+---
 
-### `tools/build_parquet.py` — the ingest
+## Data quality
 
-```bash
-python tools/build_parquet.py --source market_data --out data/parquet --reports data/reports
-```
+The ingest enforces the market structure, and every file gets a JSON report in `data/reports/`.
+The build exits non-zero when a rule fails.
 
-Reads every export, normalises the schema (deriving `trading_day` for exports made before the
-column existed), validates the invariants, derives the session and gap tables and writes
-partitioned Parquet (`symbol=/year=`). Idempotent: a file is fingerprinted and skipped when it
-has not changed. When the same series exists more than once the newest export wins.
+| Rule | |
+|---|---|
+| Timestamps strictly increasing, no duplicates | enforced |
+| No trading day on a weekend | enforced |
+| Every session opens at 18:00 Eastern | enforced |
+| Day to day gaps of 1, 3 (weekend) or 4 (holiday) | enforced |
+| `high >= max(open, close)`, `low <= min(open, close)`, `high >= low` | enforced |
+| `ask_vol + bid_vol == volume` | enforced above 0.1% of rows |
+| `num_trades <= volume` | enforced |
+| A session shorter than the median by more than 60 minutes | a gap, unless the CME calendar explains it as an early close |
+| A weekday with no session at all | reported |
 
-### `tools/init_duckdb.py` — the catalogue
+**The calendar** (`tools/cme_calendar.py`) implements the CME equity index holiday rules, derived
+from the data itself: New Year's Day, Good Friday and Christmas are full closures; every other
+federal holiday and the eves of Christmas and New Year are early closes at 12:00 CT (13:00
+Eastern). A session the calendar cannot explain is reported as a gap rather than accepted.
 
-```bash
-python tools/init_duckdb.py --parquet data/parquet --tables data/tables \
-    --reports data/reports --db data/market.duckdb
-```
+**Verified on the reference dataset** — `ESZ16`, `ESH17` and `ESM17`, 3 contracts, 262,552 bars,
+September 2016 to June 2017:
 
-Creates the catalogue tables (`instruments`, `sessions`, `data_gaps`, `rolls`, `exports`,
-`trading_calendar`, `file_reports`) and the views over the Parquet lake (`bars_1m`, `trades`,
-`bars_1m_by_day`, `trades_by_day`). The bulk data is never copied into the database.
+*   Every bar reproduced exactly, with zero value differences across every column.
+*   Timestamps in true UTC, session structure correct across the November 2016 and March 2017
+    daylight saving transitions.
+*   0 OHLC violations, 100% of prices on the 0.25 tick, and `ask_vol + bid_vol == volume` on
+    every bar but one.
+*   Every gap accounted for: the CME daily index halt, the maintenance break, the holiday early
+    closes and the weekends.
+*   Session closes tracking the front month contract to within ~1 point on average against an
+    independent market data source.
 
-### `tools/cme_calendar.py` — the CME holiday rules
+**One known gap in the feed:** ESM17 is missing the first 71 minutes of the 2017-06-04 session
+(18:00–19:10 ET). It is a gap in Sierra Chart's data and is present in every export of that
+contract. Treat that window as no-data, not as a flat market.
 
-The holiday and early close rules of the CME equity index complex, derived from the exported
-data. Used by the ingest to tell a scheduled early close apart from a real data gap.
+---
 
-```bash
-python tools/cme_calendar.py 2017
-```
+## Compared with Databento
 
-### `tools/validate_export.py` — structural checks on any export
+With Sierra's Teton service (CME MDP 3.0) and Databento's `trades` schema, both are the same
+exchange feed, and prices and sizes should line up trade for trade. What differs:
 
-```bash
-python tools/validate_export.py ESZ16_FUT_CME_bars.csv
-python tools/validate_export.py ESZ16_FUT_CME_bars_ticks.csv --kind ticks
-```
+| | Databento | MDTGrep | Impact |
+|---|---|---|---|
+| Timestamp | UTC, nanoseconds | UTC, milliseconds | Sub-millisecond ordering is lost; the file order preserves the sequence |
+| Price | raw traded price | raw traded price | none — the **bar** file is chart back adjusted, the trade file is not |
+| Size | integer | integer | none |
+| Side | exchange reported | derived from the quotes, otherwise the volume split | Mid-tick trades can be `N` here and `B`/`S` there |
+| Cancels / corrections | `action` = `C` / `X` | not provided | Databento can contain fewer trades for the same session |
+| Book depth (MBP-1 / MBO) | up to 10 price levels | not available | Depth based strategies cannot be reproduced from this feed |
+| Aggregation | one message per trade | one record per trade, when the storage unit is 1 Tick | `num_trades` reports it per row |
 
-Checks the timestamp monotonicity, duplicates and spacing, the session structure and the time base,
-the OHLC integrity and the price tick grid, `ask_vol + bid_vol == volume`, the trade counts, and
-whether `open_interest` is a duplicate of `num_trades`.
-
-### `tools/verify_vs_databento.py` — tick level comparison
+`tools/verify_vs_databento.py` measures the difference rather than assuming it:
 
 ```bash
 python tools/verify_vs_databento.py \
-    --sierra  ESZ16_FUT_CME_bars_ticks.csv \
-    --databento esz16.parquet \
-    --price-tol 0.00001
+    --sierra  market_data/bars_1m/ESZ16_FUT_CME_bars_ticks.csv \
+    --databento esz16.parquet
 ```
 
-Reports the trade count difference, the timestamp alignment within a tolerance, the price and size
-agreement, the side agreement with a confusion matrix, and examples of unmatched trades on both
-sides. A file produced by the Databento CLI works directly
-(`databento.trades.save_to_csv(...)`).
+It reports the trade count difference, the timestamp alignment within a tolerance, the price and
+size agreement, the side agreement with a confusion matrix and examples of unmatched trades on
+both sides. Acceptance criteria for a trade level export:
 
-### `tools/fix_prev_version_data.py` — repair older exports
-
-Exports made before the time base fix store the chart wall clock as if it was UTC (4–5 hours
-behind true UTC) and duplicate `num_trades` into `open_interest`:
-
-```bash
-python tools/fix_prev_version_data.py market_data/*.csv --source-tz America/New_York
-```
-
-Converts the timestamps to real UTC (daylight saving aware), drops the duplicated column and
-writes the counts as integers.
+| Metric | Target |
+|---|---|
+| Price match (exact) | ≥ 99.5% |
+| Volume match | ≥ 99% |
+| Timestamps matched within ±1 ms | ≥ 99.9% |
+| Unmatched trades | < 0.5% |
+| Side agreement (`B`/`S`) | ≥ 95% |
 
 ---
 
-## Long horizon collection
+## Collecting a long history
 
-Ten, twenty or thirty years of ES, measured against the exports in `market_data/`:
-
-| Horizon | 1 minute bars | Tick records | CSV landing zone | Parquet |
-|---------|--------------|--------------|------------------|---------|
+| Horizon | 1 minute bars | Trade records | CSV landing zone | Parquet |
+|---|---|---|---|---|
 | 10 years | 3.4M | ~900M | 63 GB | ~9 GB |
 | 30 years | 10.4M | ~2.7B | 190 GB | ~27 GB |
 
-Bars are trivial. **Ticks are the expensive part**, on three axes at once: the size of Sierra
-Chart's `.scid` files at 1 Tick storage, the time it takes to read them back out, and the disk
-space of the CSV landing zone. The realistic plan is therefore:
+Bars are cheap. Trade records are the expensive part — in Sierra Chart's data files, in the export
+time and in the landing zone. The practical split is **1 minute bars for the full history** and
+**trade records for the window the strategy research actually needs**.
 
-*   **1 minute bars for the full history** (30 years is ~30 MB of Parquet).
-*   **Tick records for the recent window** that the strategy research actually needs.
+Collect the most recent decade first and walk backwards: tick level history is most likely to
+exist for the recent past, a schema change is cheapest to make early, and the recent data is the
+easiest to validate against another vendor.
 
-### Storage
-
-Use **partitioned Parquet on disk and query it with DuckDB** rather than importing into a row
-store. The backtest then reads the Parquet files directly, with column pruning and row group
-pruning, and no ETL copy of the data exists:
-
-```sql
-SELECT ts_ms, open, high, low, close
-FROM read_parquet('market_data/bars_1m/symbol=ESH17/year=2017/*.parquet')
-WHERE trading_day BETWEEN '2017-01-01' AND '2017-03-13';
-```
-
-DuckDB streams 2.7B rows without loading them into memory. SQLite is fine for the **catalog**
-(metadata) but painful for the tick rows; Postgres/Timescale only if the bot needs to write
-concurrently with the backtest.
-
-### Tables
-
-```sql
-bars_1m(ts_ms BIGINT, trading_day DATE, instrument, symbol,
-         open, high, low, close DOUBLE,
-         volume, ask_vol, bid_vol, num_trades INT)
-
-trades(ts_ms BIGINT, trading_day DATE, instrument, symbol,
-       price DOUBLE, size INT, side VARCHAR, bid, ask DOUBLE, delta INT)
-
-instruments(instrument, symbol, exchange, asset_class, expiry_date,
-            first_notice_date, multiplier, tick_size, currency)
-sessions(trading_day, symbol, open_ts, close_ts, bars, volume, is_early_close)
-data_gaps(symbol, trading_day, start_ts, end_ts, minutes)
-rolls(instrument_from, instrument_to, ratio, difference, roll_date)
-```
-
-*   `data_gaps` — the pipeline finds the gaps automatically. One is already known: ESM17 is missing
-    the first 71 minutes of the 2017-06-04 session. A backtest that silently trades through a hole
-    is worse than one that skips it.
-*   `rolls` — the calendar spreads between the quarterly contracts are measurable from the data
-    (ESZ16 → ESH17 was +5.50 points, ESH17 → ESM17 +3.20, constant to within a point), so any roll
-    rule can be validated rather than assumed.
-
-Keep **raw and adjusted** separate: the tick data is raw, the bar data follows the chart's back
-adjustment. A continuous price series is generated at load time from the raw contracts through
-the `rolls` table, never by exporting adjusted charts.
-
-### Collection order
-
-**Start with the most recent ten years, then walk backwards.** The order does not affect the
-result — the ETL is per contract — but the order in which you collect does affect how much work
-you might have to redo:
-
-*   Tick level historical data is most likely to be available for the recent past. If the older
-    years only exist as minute buckets, you want to find that out on one decade rather than
-    after thirty.
-*   If the schema has to change, you find out while the collection is young.
-*   The recent data is the easiest to validate, because that is the range a comparison against
-    another vendor is most likely to cover.
-
-Never edit the exported CSVs in place. They are the reproducible landing zone; the ETL reads them,
-validates them and writes Parquet.
+Never edit the exported CSVs. They are the reproducible landing zone.
 
 ---
 
-## Validation status
+## Configuration reference
 
-The bar exports for `ESZ16`, `ESH17` and `ESM17` (3 contracts, 262,552 bars, Sept 2016 – Jun 2017)
-have been verified end to end:
+### Study inputs
 
-*   Every bar of the original export is present, with **zero value differences** in `open`, `high`,
-    `low`, `close`, `volume`, `ask_vol`, `bid_vol` and `num_trades`.
-*   Timestamps are true UTC and the session structure is correct across the November 2016 and
-    March 2017 daylight saving transitions.
-*   0 OHLC violations, 100% of prices on the 0.25 tick, `ask_vol + bid_vol == volume` on every bar
-    but one (27 of 1,173 contracts unclassified in a single minute).
-*   The gaps are all market structure: the CME daily index halt (16:15–16:30 ET), the maintenance
-    break (17:00–18:00 ET), the holiday early closes (12:59 and 13:14 ET) and the weekends.
-*   Session closes track the front month contract to within ~1 point on average against an
-    independent market data source; the deviations are settlement-versus-close differences on
-    volatile days.
+| # | Input | Default | |
+|---|---|---|---|
+| 0 | Trigger Export on Full Recalc | Yes | Export on every full recalculation of the chart |
+| 1 | Export File Suffix | `_bars` | Suffix of the output file |
+| 2 | Export Mode | Bars | `Bars`, `Ticks` or `Both` |
+| 3 | Output Directory | `C:\SierraChart\SCAssistData\` | Created if it does not exist |
+| 4 | Timestamp Basis | Chart Local (as-is) | `UTC` for a direct comparison with Databento |
+| 5 | Max Bars For Tick Export | 0 (all) | Limits how many chart bars the trade export reads |
 
-**Known source data gap:** the intraday data of `ESM17` is missing the first 71 minutes of the
-2017-06-04 session (18:00–19:10 ET). This is a gap in Sierra's data, not in the export — it is
-present in every export of that contract. Treat that window as no-data rather than as a flat market.
+A change to any of them re-runs the export immediately.
+
+### Trade level data
+
+The trade export reads the intraday data files of the chart, one record at a time. It needs an
+intraday chart and `Global Settings` → `Data/Trade Service Settings` → `Common Settings` →
+**Intraday Data Storage Time Unit** = **1 Tick**, followed by `Edit` → `Delete and Download Data`
+on an intraday chart per symbol — the setting only affects data collected or downloaded
+afterwards.
+
+Reading every trade of a long history makes the Sierra Chart user interface freeze; `Max Bars For
+Tick Export` bounds it.
+
+The `num_trades` column reports the storage granularity of the data itself:
+
+| `num_trades` | |
+|---|---|
+| `1` on nearly every row | one record per trade — trade level data |
+| more than 1 | the records aggregate trades — the storage unit is coarser for that data |
+
+The **Time and Sales** window shows the same thing without an export: one line per trade means 1
+Tick storage.
 
 ---
 
 ## Troubleshooting
 
-**The study was recompiled, the build reported no errors, but no CSV appears.**
+| Symptom | Cause | Fix |
+|---|---|---|
+| The build reports no errors and no CSV appears | The DLL was built against an outdated `sierrachart.h` and Sierra Chart rejected it at runtime | Build **Remote**, restart Sierra Chart, re-add the study. The `MDTGrep: ACSIL interface ...` log line is the confirmation that it ran |
+| The study settings show only two inputs | The previous DLL is still loaded | Rebuild, restart, re-add the study — it has six inputs |
+| Timestamps are 4–5 hours behind UTC | The chart is on Eastern and `Timestamp Basis` is `Chart Local` | Set `Timestamp Basis` to `UTC`, or set the chart time zone to UTC |
+| The first hour of the summer sessions is missing or shifted | Fixed UTC session times against an exchange daylight saving change | Use the 24 hour session, or Eastern with `Timestamp Basis = UTC` |
+| The first session of the file is missing | The chart's first day is the day the data starts on | Extend the date range one day earlier |
+| Bars have ragged durations and ~160 trades each | The bar period is `Range Per Bar`, a price movement bar | Use `Days-Mins-Secs-Milliseconds Per Bar` = 1 minute |
+| Trade rows contain many trades | The intraday storage is coarser than 1 Tick | Set the storage unit to 1 Tick and re-download the intraday data |
+| The export is very slow | Every trade of a long history is being read | Use `Max Bars For Tick Export`, or export day by day |
 
-See [Build and the interface version](#build-and-the-interface-version).
+Log messages that explain an empty or partial result:
 
-**Other causes of "no output":**
-
-| Symptom | Cause |
-|---------|-------|
-| `MDTGrep: waiting for the historical data download to complete...` | The export starts once the download finishes; the log confirms when it ran. |
-| `MDTGrep: no chart data loaded, nothing to export.` | No data on the chart (wrong symbol, no history, or the download failed). |
-| `MDTGrep: no intraday trade records were found.` | Tick export on a daily chart, or the Intraday Data Storage Time Unit is not 1 Tick. |
-| `MDTGrep: unable to create the output directory: ...` | The output directory could not be created (permissions/path). |
-| File is written but the data looks stale | The export only runs on a full recalculation — use `Edit → Recalculate` on the chart after changing the chart settings. |
+| Message | Meaning |
+|---|---|
+| `MDTGrep: waiting for the historical data download to complete...` | The export starts once the download finishes |
+| `MDTGrep: no chart data loaded, nothing to export.` | No data on the chart |
+| `MDTGrep: no intraday trade records were found.` | A daily chart, or the storage unit is not 1 Tick |
+| `MDTGrep: unable to create the output directory: ...` | The directory could not be created |
+| `MDTGrep: the timestamps of ... are NOT true UTC.` | The chart time zone is not UTC and `Timestamp Basis` is `Chart Local` |
 
 ---
 
-## Repository layout
+## Reference
 
-```
-MDTGrep.cpp                      the ACSIL study
-README.md                        this document
-PLAN.md                          requirements and roadmap
-docs/SPEC.md                     the technical specification of the data lake
-tools/build_parquet.py           ingest: CSV -> validated Parquet
-tools/init_duckdb.py             the DuckDB catalogue and the views over the lake
-tools/validate_export.py         structural validation of an export
-tools/verify_vs_databento.py     tick level comparison against Databento
-tools/fix_prev_version_data.py   repair of exports made with the older study
-tools/cme_calendar.py            the CME equity index holiday calendar
-tools/instruments.csv            the contract specifications
-market_data/bars_1m/             the reviewed exports (the current schema)
-market_data/legacy_bars/         exports made before the trading_day column
-data/                            the derived lake (Parquet, catalogue, reports) - not committed
-defunct/                         earlier versions of the exporter, kept for reference
-```
+| | |
+|---|---|
+| `docs/SPEC.md` | The technical specification: data model, time model, calendar model, storage layout, pipeline contracts, validation rules and the backtest caveats |
+| `PLAN.md` | Requirements and roadmap |
+| `market_data/` | The exports, with the naming conventions and the known gap |
+| `tools/` | The pipeline and the verification tools — `pip install pandas pyarrow duckdb` |
 
-## Future enhancements
+**Roadmap**
 
-*   **Parquet export.** A few years of tick data is 30+ GB in CSV. Parquet is columnar and
-    compresses several times better, which matters for the load times of the backtest and training
-    pipelines.
-*   **Incremental / append mode** so a long history can be built up session by session instead of
-    re-exporting everything.
+*   Incremental collection, so a long history can be built session by session.
+*   More instruments in the contract catalogue.
+*   A continuous-series builder driven by the `rolls` table, for price based strategies.
