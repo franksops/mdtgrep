@@ -119,11 +119,15 @@ Output directory (input #3), default `C:\SierraChart\SCAssistData\`:
 ### Bars
 
 ```
-unix_ts_ms,open,high,low,close,volume,ask_vol,bid_vol,num_trades,open_interest
-1795278600000,5321.00,5321.75,5321.00,5321.50,154,82,72,98,0
+unix_ts_ms,trading_day,open,high,low,close,volume,ask_vol,bid_vol,num_trades,open_interest
+1795278600000,2026-11-23,5321.00,5321.75,5321.00,5321.50,154,82,72,98,0
 ```
 
 *   `unix_ts_ms` — Unix epoch milliseconds, start of the chart bar.
+*   `trading_day` — the **exchange trading day** (`YYYY-MM-DD`) the bar belongs to. The CME session
+    opens at 18:00 and closes at 17:00 Eastern, so the evening bars carry the *next* day's label.
+    This is the session key for grouping, joining and gap detection, and it is computed with the
+    daylight saving rules so it stays correct over the whole history.
 *   `open, high, low, close` — prices. These follow the **back adjustment settings of the chart**.
 *   `volume, ask_vol, bid_vol, num_trades` — integers. `ask_vol`/`bid_vol` are the traded-at-ask /
     traded-at-bid volumes, i.e. the buy/sell split.
@@ -134,12 +138,13 @@ unix_ts_ms,open,high,low,close,volume,ask_vol,bid_vol,num_trades,open_interest
 ### Ticks
 
 ```
-unix_ts_ms,price,volume,ask_vol,bid_vol,delta,num_trades,side,bid,ask
-1795278602150,5321.25,2,2,0,2,1,B,5321.00,5321.25
-1795278602300,5321.00,5,0,5,-5,2,S,5321.00,5321.25
+unix_ts_ms,trading_day,price,volume,ask_vol,bid_vol,delta,num_trades,side,bid,ask
+1795278602150,2026-11-23,5321.25,2,2,0,2,1,B,5321.00,5321.25
+1795278602300,2026-11-23,5321.00,5,0,5,-5,2,S,5321.00,5321.25
 ```
 
 *   `unix_ts_ms` — Unix epoch milliseconds of the trade.
+*   `trading_day` — the exchange trading day of the trade, same rule as the bar export.
 *   `price` — traded price (raw, not back adjusted).
 *   `volume, ask_vol, bid_vol` — trade volume and its buy/sell split.
 *   `delta` — `ask_vol - bid_vol`.
@@ -150,6 +155,32 @@ unix_ts_ms,price,volume,ask_vol,bid_vol,delta,num_trades,side,bid,ask
     When the record does not carry the quotes the side falls back to the buy/sell volume split.
 *   `bid, ask` — the bid and ask prices of the moment of the trade. Only present when the data
     service supplied the quotes with the trade, otherwise `0`.
+
+### Metadata sidecar
+
+Every export also writes `<file>_meta.csv` next to the data file:
+
+```
+key,value
+symbol,ESH17_FUT_CME
+export_mode,bars
+timestamp_basis,UTC
+acsil_interface_version,2217
+bar_period_type,Days-Mins-Secs-Milliseconds
+bar_period_parameter1,60
+is_range_bars,0
+rows,87162
+first_ts_ms,1481476800000
+last_ts_ms,1489593600000
+first_trading_day,2016-12-12
+last_trading_day,2017-03-15
+exported_at_utc,2026-11-22 15:25:33
+```
+
+It records the settings that produced the file. The chart time zone and the session times are not
+visible in the data itself, so they have to be captured when the file is written — without this a
+collection of 40+ contracts cannot be audited after the fact. `is_range_bars` is 1 when the chart
+was set to a price-movement bar period, which produces bars that are not time based.
 
 ---
 
@@ -325,6 +356,84 @@ python tools/fix_prev_version_data.py market_data/*.csv --source-tz America/New_
 
 Converts the timestamps to real UTC (daylight saving aware), drops the duplicated column and
 writes the counts as integers.
+
+---
+
+## Long horizon collection
+
+Ten, twenty or thirty years of ES, measured against the exports in `market_data/`:
+
+| Horizon | 1 minute bars | Tick records | CSV landing zone | Parquet |
+|---------|--------------|--------------|------------------|---------|
+| 10 years | 3.4M | ~900M | 63 GB | ~9 GB |
+| 30 years | 10.4M | ~2.7B | 190 GB | ~27 GB |
+
+Bars are trivial. **Ticks are the expensive part**, on three axes at once: the size of Sierra
+Chart's `.scid` files at 1 Tick storage, the time it takes to read them back out, and the disk
+space of the CSV landing zone. The realistic plan is therefore:
+
+*   **1 minute bars for the full history** (30 years is ~30 MB of Parquet).
+*   **Tick records for the recent window** that the strategy research actually needs.
+
+### Storage
+
+Use **partitioned Parquet on disk and query it with DuckDB** rather than importing into a row
+store. The backtest then reads the Parquet files directly, with column pruning and row group
+pruning, and no ETL copy of the data exists:
+
+```sql
+SELECT ts_ms, open, high, low, close
+FROM read_parquet('market_data/bars_1m/symbol=ESH17/year=2017/*.parquet')
+WHERE trading_day BETWEEN '2017-01-01' AND '2017-03-13';
+```
+
+DuckDB streams 2.7B rows without loading them into memory. SQLite is fine for the **catalog**
+(metadata) but painful for the tick rows; Postgres/Timescale only if the bot needs to write
+concurrently with the backtest.
+
+### Tables
+
+```sql
+bars_1m(ts_ms BIGINT, trading_day DATE, instrument, symbol,
+         open, high, low, close DOUBLE,
+         volume, ask_vol, bid_vol, num_trades INT)
+
+trades(ts_ms BIGINT, trading_day DATE, instrument, symbol,
+       price DOUBLE, size INT, side VARCHAR, bid, ask DOUBLE, delta INT)
+
+instruments(instrument, symbol, exchange, asset_class, expiry_date,
+            first_notice_date, multiplier, tick_size, currency)
+sessions(trading_day, symbol, open_ts, close_ts, bars, volume, is_early_close)
+data_gaps(symbol, trading_day, start_ts, end_ts, minutes)
+rolls(instrument_from, instrument_to, ratio, difference, roll_date)
+```
+
+*   `data_gaps` — the pipeline finds the gaps automatically. One is already known: ESM17 is missing
+    the first 71 minutes of the 2017-06-04 session. A backtest that silently trades through a hole
+    is worse than one that skips it.
+*   `rolls` — the calendar spreads between the quarterly contracts are measurable from the data
+    (ESZ16 → ESH17 was +5.50 points, ESH17 → ESM17 +3.20, constant to within a point), so any roll
+    rule can be validated rather than assumed.
+
+Keep **raw and adjusted** separate: the tick data is raw, the bar data follows the chart's back
+adjustment. A continuous price series is generated at load time from the raw contracts through
+the `rolls` table, never by exporting adjusted charts.
+
+### Collection order
+
+**Start with the most recent ten years, then walk backwards.** The order does not affect the
+result — the ETL is per contract — but the order in which you collect does affect how much work
+you might have to redo:
+
+*   Tick level historical data is most likely to be available for the recent past. If the older
+    years only exist as minute buckets, you want to find that out on one decade rather than
+    after thirty.
+*   If the schema has to change, you find out while the collection is young.
+*   The recent data is the easiest to validate, because that is the range a comparison against
+    another vendor is most likely to cover.
+
+Never edit the exported CSVs in place. They are the reproducible landing zone; the ETL reads them,
+validates them and writes Parquet.
 
 ---
 

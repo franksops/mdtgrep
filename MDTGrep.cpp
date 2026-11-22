@@ -149,8 +149,7 @@ static bool EnsureDirectory(const SCString& Path)
 }
 
 // Replace the characters that are not allowed in a Windows file name.
-static SCString MakeFileNameSafe(const SCString& In)
-{
+static SCString MakeFileNameSafe(const SCString& In){
 	std::string Out;
 
 	const char* pChars = In.GetChars();
@@ -197,17 +196,88 @@ static bool IsIntradayChart(SCStudyInterfaceRef sc)
 }
 
 // ---------------------------------------------------------------------------
+// Trading day
+// ---------------------------------------------------------------------------
+
+// The exchange trading day of a chart bar or of an intraday record.
+//
+// The CME equity index session opens at 18:00 and closes at 17:00 Eastern, so
+// everything from 18:00 Eastern onwards belongs to the next trading day.  The
+// conversion to Eastern uses the daylight saving rules of the chart, so the
+// result stays correct over the whole history, including the daylight saving
+// transitions.
+struct TradingDayInfo
+{
+    SCString TradingDay;  // YYYY-MM-DD
+    int EasternHour = 0;
+};
+
+// Advance a civil date by one day.
+static void NextCivilDate(int& Year, int& Month, int& Day)
+{
+    static const int DaysInMonth[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+    int Days = DaysInMonth[Month - 1];
+
+    if (Month == 2 && ((Year % 4 == 0 && Year % 100 != 0) || Year % 400 == 0))
+        Days = 29;
+
+    ++Day;
+
+    if (Day > Days)
+    {
+        Day = 1;
+        ++Month;
+
+        if (Month > 12)
+        {
+            Month = 1;
+            ++Year;
+        }
+    }
+}
+
+static TradingDayInfo GetTradingDayInfo(SCStudyInterfaceRef sc, const SCDateTime& DateTime)
+{
+    TradingDayInfo Info;
+
+    const SCDateTimeMS EasternDateTime = sc.ConvertDateTimeFromChartTimeZone(DateTime, TIMEZONE_NEW_YORK);
+
+    int Year = 0, Month = 0, Day = 0, Hour = 0, Minute = 0, Second = 0;
+    EasternDateTime.GetDateTimeYMDHMS(Year, Month, Day, Hour, Minute, Second);
+
+    Info.EasternHour = Hour;
+
+    if (Hour >= 18)
+        NextCivilDate(Year, Month, Day);
+
+    Info.TradingDay.Format("%04d-%02d-%02d", Year, Month, Day);
+
+    return Info;
+}
+
+// Statistics of an export, written to the metadata sidecar file.
+struct ExportStats
+{
+    int64_t RowCount = 0;
+    int64_t FirstTs = 0;
+    int64_t LastTs = 0;
+    SCString FirstTradingDay;
+    SCString LastTradingDay;
+};
+
+// ---------------------------------------------------------------------------
 // Export of the chart bars
 // ---------------------------------------------------------------------------
 
-static bool ExportBars(SCStudyInterfaceRef sc, const SCString& FilePath, bool bUtc, bool bIntradayChart, int& BarsWritten)
+static bool ExportBars(SCStudyInterfaceRef sc, const SCString& FilePath, bool bUtc, bool bIntradayChart, ExportStats& Stats)
 {
 	std::ofstream OutFile(FilePath.GetChars(), std::ios::out | std::ios::trunc);
 
 	if (!OutFile.is_open())
 		return false;
 
-	OutFile << "unix_ts_ms,open,high,low,close,volume,ask_vol,bid_vol,num_trades,open_interest\n";
+	OutFile << "unix_ts_ms,trading_day,open,high,low,close,volume,ask_vol,bid_vol,num_trades,open_interest\n";
 
 	// Prices keep their fractional part, the counts are written as integers.
 	OutFile << std::fixed << std::setprecision(5);
@@ -216,11 +286,14 @@ static bool ExportBars(SCStudyInterfaceRef sc, const SCString& FilePath, bool bU
 	{
 		const int64_t UnixTS_ms = BarTimeToUnixMs(sc, sc.BaseDateTimeIn[i], bUtc);
 
+		const TradingDayInfo TradingDay = GetTradingDayInfo(sc, sc.BaseDateTimeIn[i]);
+
 		const int64_t OpenInterest = bIntradayChart
 			? 0
 			: (int64_t)std::llround((double)sc.OpenInterest[i]);
 
 		OutFile << UnixTS_ms << ","
+			<< TradingDay.TradingDay.GetChars() << ","
 			<< (double)sc.Open[i] << ","
 			<< (double)sc.High[i] << ","
 			<< (double)sc.Low[i] << ","
@@ -230,11 +303,20 @@ static bool ExportBars(SCStudyInterfaceRef sc, const SCString& FilePath, bool bU
 			<< (int64_t)std::llround((double)sc.BidVolume[i]) << ","
 			<< (int64_t)std::llround((double)sc.NumberOfTrades[i]) << ","
 			<< OpenInterest << "\n";
+
+		if (i == 0)
+		{
+			Stats.FirstTs = UnixTS_ms;
+			Stats.FirstTradingDay = TradingDay.TradingDay;
+		}
+
+		Stats.LastTs = UnixTS_ms;
+		Stats.LastTradingDay = TradingDay.TradingDay;
 	}
 
 	OutFile.close();
 
-	BarsWritten = sc.ArraySize;
+	Stats.RowCount = sc.ArraySize;
 
 	return true;
 }
@@ -243,20 +325,20 @@ static bool ExportBars(SCStudyInterfaceRef sc, const SCString& FilePath, bool bU
 // Export of the underlying intraday trade records
 // ---------------------------------------------------------------------------
 
-static bool ExportTicks(SCStudyInterfaceRef sc, const SCString& FilePath, bool bUtc, int MaxBars, int64_t& TicksWritten)
+static bool ExportTicks(SCStudyInterfaceRef sc, const SCString& FilePath, bool bUtc, int MaxBars, ExportStats& Stats)
 {
 	std::ofstream OutFile(FilePath.GetChars(), std::ios::out | std::ios::trunc);
 
 	if (!OutFile.is_open())
 		return false;
 
-	OutFile << "unix_ts_ms,price,volume,ask_vol,bid_vol,delta,num_trades,side,bid,ask\n";
+	OutFile << "unix_ts_ms,trading_day,price,volume,ask_vol,bid_vol,delta,num_trades,side,bid,ask\n";
 
 	OutFile << std::fixed << std::setprecision(5);
 
 	const int LastBar = (MaxBars > 0 && MaxBars < sc.ArraySize) ? MaxBars : sc.ArraySize;
 
-	TicksWritten = 0;
+	Stats.RowCount = 0;
 
 	for (int i = 0; i < LastBar; ++i)
 	{
@@ -286,6 +368,8 @@ static bool ExportTicks(SCStudyInterfaceRef sc, const SCString& FilePath, bool b
 
 			const int64_t UnixTS_ms = FileTimeToUnixMs(sc, Record.DateTime, bUtc);
 			const int64_t Delta = (int64_t)Record.AskVolume - (int64_t)Record.BidVolume;
+
+			const TradingDayInfo TradingDay = GetTradingDayInfo(sc, Record.DateTime);
 
 			// The bid and ask prices are only present when the record carries
 			// the quotes of the moment of the trade.  In that case the High
@@ -319,6 +403,7 @@ static bool ExportTicks(SCStudyInterfaceRef sc, const SCString& FilePath, bool b
 				Side = 'S';
 
 			OutFile << UnixTS_ms << ","
+				<< TradingDay.TradingDay.GetChars() << ","
 				<< (double)Price << ","
 				<< (int64_t)Record.TotalVolume << ","
 				<< (int64_t)Record.AskVolume << ","
@@ -329,7 +414,16 @@ static bool ExportTicks(SCStudyInterfaceRef sc, const SCString& FilePath, bool b
 				<< (double)Bid << ","
 				<< (double)Ask << "\n";
 
-			++TicksWritten;
+			if (Stats.RowCount == 0)
+			{
+				Stats.FirstTs = UnixTS_ms;
+				Stats.FirstTradingDay = TradingDay.TradingDay;
+			}
+
+			Stats.LastTs = UnixTS_ms;
+			Stats.LastTradingDay = TradingDay.TradingDay;
+
+			++Stats.RowCount;
 		}
 
 		// Release the intraday file lock.
@@ -340,6 +434,77 @@ static bool ExportTicks(SCStudyInterfaceRef sc, const SCString& FilePath, bool b
 	OutFile.close();
 
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Metadata sidecar
+// ---------------------------------------------------------------------------
+
+// A readable name for the bar period type of the chart.
+static const char* GetBarPeriodTypeName(n_ACSIL::s_BarPeriod& BarPeriod)
+{
+	switch (BarPeriod.IntradayChartBarPeriodType)
+	{
+		case IBPT_DAYS_MINS_SECS: return "Days-Mins-Secs-Milliseconds";
+		case IBPT_VOLUME_PER_BAR: return "Volume Per Bar";
+		case IBPT_NUM_TRADES_PER_BAR: return "Number of Trades Per Bar";
+		case IBPT_RANGE_IN_TICKS_STANDARD: return "Range Per Bar - Standard (in ticks)";
+		case IBPT_RANGE_IN_TICKS_NEWBAR_ON_RANGEMET: return "Range Per Bar - New Bar on Range Met (in ticks)";
+		case IBPT_RANGE_IN_TICKS_TRUE: return "Range Per Bar - True (in ticks)";
+		case IBPT_RANGE_IN_TICKS_FILL_GAPS: return "Range Per Bar - Fill Gaps (in ticks)";
+		case IBPT_RANGE_IN_TICKS_OPEN_EQUAL_CLOSE: return "Range Per Bar - Open=Close (in ticks)";
+		case IBPT_REVERSAL_IN_TICKS: return "Reversal Bar (in ticks)";
+		case IBPT_RENKO_IN_TICKS: return "Renko Bar (in ticks)";
+		case IBPT_ALIGNED_RENKO: return "Aligned Renko Bar (in ticks)";
+		case IBPT_DELTA_VOLUME_PER_BAR: return "Delta Volume Per Bar";
+		case IBPT_FLEX_RENKO_IN_TICKS: return "Flex Renko (in ticks)";
+		case IBPT_FLEX_RENKO_IN_TICKS_INVERSE_SETTINGS: return "Flex Renko Inverse Set (in ticks)";
+		case IBPT_PRICE_CHANGES_PER_BAR: return "Price Changes Per Bar";
+		case IBPT_MONTHS_PER_BAR: return "Months Per Bar";
+		case IBPT_POINT_AND_FIGURE: return "Point And Figure Bar";
+		default: return "Other";
+	}
+}
+
+// Writes a metadata sidecar next to the data file.  It records the settings
+// that produced the file, which is what makes a large collection auditable:
+// the chart time zone and the session times are not visible in the data
+// itself, so they have to be captured when the file is written.
+static void WriteManifest(SCStudyInterfaceRef sc, const SCString& DataFilePath, const SCString& ExportMode, bool bUtc, const ExportStats& Stats)
+{
+	const SCString MetaPath = DataFilePath + "_meta.csv";
+
+	std::ofstream OutFile(MetaPath.GetChars(), std::ios::out | std::ios::trunc);
+
+	if (!OutFile.is_open())
+		return;
+
+	n_ACSIL::s_BarPeriod BarPeriod;
+	sc.GetBarPeriodParameters(BarPeriod);
+
+	int Year = 0, Month = 0, Day = 0, Hour = 0, Minute = 0, Second = 0;
+	sc.GetCurrentDateTime().GetDateTimeYMDHMS(Year, Month, Day, Hour, Minute, Second);
+
+	SCString ExportedAt;
+	ExportedAt.Format("%04d-%02d-%02d %02d:%02d:%02d", Year, Month, Day, Hour, Minute, Second);
+
+	OutFile << "key,value\n";
+	OutFile << "symbol," << sc.Symbol.GetChars() << "\n";
+	OutFile << "export_mode," << ExportMode.GetChars() << "\n";
+	OutFile << "timestamp_basis," << (bUtc ? "UTC" : "Chart Local") << "\n";
+	OutFile << "acsil_interface_version," << SC_DLL_VERSION << "\n";
+	OutFile << "bar_period_type," << GetBarPeriodTypeName(BarPeriod) << "\n";
+	OutFile << "bar_period_parameter1," << BarPeriod.IntradayChartBarPeriodParameter1 << "\n";
+	OutFile << "bar_period_parameter2," << BarPeriod.IntradayChartBarPeriodParameter2 << "\n";
+	OutFile << "is_range_bars," << (BarPeriod.AreRangeBars() ? 1 : 0) << "\n";
+	OutFile << "rows," << Stats.RowCount << "\n";
+	OutFile << "first_ts_ms," << Stats.FirstTs << "\n";
+	OutFile << "last_ts_ms," << Stats.LastTs << "\n";
+	OutFile << "first_trading_day," << Stats.FirstTradingDay.GetChars() << "\n";
+	OutFile << "last_trading_day," << Stats.LastTradingDay.GetChars() << "\n";
+	OutFile << "exported_at_utc," << ExportedAt.GetChars() << "\n";
+
+	OutFile.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -487,13 +652,18 @@ SCSFExport scsf_MDTGrep(SCStudyInterfaceRef sc)
 		BarFilePath.Format("%s%s%s.csv", OutputDir.GetChars(), SafeSymbol.GetChars(), SafeSuffix.GetChars());
 
 		int BarsWritten = 0;
+		ExportStats BarStats;
 
-		if (!ExportBars(sc, BarFilePath, bUtc, bIntradayChart, BarsWritten))
+		if (!ExportBars(sc, BarFilePath, bUtc, bIntradayChart, BarStats))
 		{
 			Msg.Format("MDTGrep: failed to open file for writing: %s", BarFilePath.GetChars());
 			sc.AddMessageToLog(Msg, 1);
 			return;
 		}
+
+		BarsWritten = (int)BarStats.RowCount;
+
+		WriteManifest(sc, BarFilePath, "bars", bUtc, BarStats);
 
 		Msg.Format("MDTGrep: ACSIL interface %d - exported %d bars to %s (%s)", SC_DLL_VERSION, BarsWritten, BarFilePath.GetChars(), bUtc ? "UTC" : "chart local time");
 		sc.AddMessageToLog(Msg, 0);
@@ -512,14 +682,18 @@ SCSFExport scsf_MDTGrep(SCStudyInterfaceRef sc)
 		TickFilePath.Format("%s%s%s_ticks.csv", OutputDir.GetChars(), SafeSymbol.GetChars(), SafeSuffix.GetChars());
 
 		int64_t TicksWritten = 0;
+		ExportStats TickStats;
 
-		if (!ExportTicks(sc, TickFilePath, bUtc, MaxTickBars, TicksWritten))
+		if (!ExportTicks(sc, TickFilePath, bUtc, MaxTickBars, TickStats))
 		{
 			Msg.Format("MDTGrep: failed to open file for writing: %s", TickFilePath.GetChars());
 			sc.AddMessageToLog(Msg, 1);
 			return;
 		}
 
+		TicksWritten = TickStats.RowCount;
+
+		WriteManifest(sc, TickFilePath, "ticks", bUtc, TickStats);
 		Msg.Format("MDTGrep: ACSIL interface %d - exported %lld ticks to %s (%s)", SC_DLL_VERSION, (long long)TicksWritten, TickFilePath.GetChars(), bUtc ? "UTC" : "chart local time");
 		sc.AddMessageToLog(Msg, 0);
 

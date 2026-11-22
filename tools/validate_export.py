@@ -166,6 +166,47 @@ def check_ticks(df: pd.DataFrame) -> None:
         print(f"     on the 0.25 tick grid: {bool(grid)}")
 
 
+def check_trading_day(df: pd.DataFrame) -> None:
+    """Validate the exchange trading day column."""
+    if "trading_day" not in df.columns:
+        print("\n  --- trading day ---")
+        print("     trading_day column    : MISSING (exports before the column was added)")
+        return
+
+    print("\n  --- trading day ---")
+    td = pd.to_datetime(df["trading_day"], format="%Y-%m-%d", errors="coerce")
+    if td.isna().any():
+        print(f"     unparsable values     : {int(td.isna().sum())}")
+        return
+
+    days = sorted(set(td.dt.date))
+    weekend = [x for x in days if x.weekday() >= 5]
+    gaps = {}
+    for i in range(len(days) - 1):
+        g = (days[i + 1] - days[i]).days
+        gaps[g] = gaps.get(g, 0) + 1
+
+    print(f"     trading days          : {len(days):,}  ({days[0]} -> {days[-1]})")
+    print(f"     weekend trading days  : {weekend if weekend else 'none'}")
+
+    # A trading day must start at the 18:00 Eastern session open.
+    firsts = df.groupby("trading_day").first()
+    et_hours = set(pd.to_datetime(firsts["ts"], unit="ms", utc=True)
+                   .dt.tz_convert("America/New_York").dt.hour)
+    bad = sorted(et_hours - {18})
+    print(f"     session open (ET)     : {sorted(et_hours)}"
+          + (f"   <- {bad} is not 18:00" if bad else "   (all 18:00)"))
+
+    # The trading day must advance by 1 day, 3 over a weekend, 4+ over a holiday.
+    print(f"     day-to-day gaps       : {dict(sorted(gaps.items()))}  (1=normal, 3=weekend, 4=holiday)")
+
+    # A trading day must not be more than one calendar day behind its bars.
+    et_date = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("America/New_York").dt.normalize().dt.tz_localize(None)
+    label = pd.to_datetime(td.dt.strftime("%Y-%m-%d"))
+    off = (et_date - label).dt.days
+    print(f"     label offset (days)   : {sorted(set(off))}  (-1 = evening session, 0 = same calendar day)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate an MDTGrep export.")
     parser.add_argument("files", nargs="+", type=Path)
@@ -188,6 +229,7 @@ def main() -> None:
 
         df = load(path, kind, args.source_tz)
         check_timestamps(df, kind, args.source_tz)
+        check_trading_day(df)
         if kind == "bars":
             check_bars(df)
         else:
