@@ -28,7 +28,7 @@ and other sources.
 | Bar Period | `Intraday Chart Bar Period` | `Days-Mins-Secs-Milliseconds Per Bar` = **1 minute** |
 | Time Zone | `Advanced Settings` | **UTC** |
 | Session Times | `Session Times` | Start **00:00:00**, End **23:59:59** |
-| Date range | `Use Date Range` | From = contract open **− 1 day**, To = contract close **+ 1 day** |
+| Date range | `Use Date Range` | From = contract open **−1 day**, To = contract close **+1 day** |
 
 The bar period is **1 minute for both exports**. The tick export reads the intraday data files
 directly, so the bar period only controls how those records are iterated — it does not change the
