@@ -33,9 +33,3 @@ python tools/verify_vs_databento.py \
     --sierra market_data/ESZ16_FUT_CME_bars_ticks.csv \
     --databento esz16.parquet
 ```
-
-## Known gap
-
-The intraday data of `ESM17` is missing the first 71 minutes of the 2017-06-04 session
-(18:00–19:10 ET). This is a gap in Sierra Chart's data, not in the export — it is present in every
-export of that contract. Treat that window as no-data rather than as a flat market.
