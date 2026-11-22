@@ -412,10 +412,10 @@ Log messages that explain an empty or partial result:
 
 | | |
 |---|---|
-| `docs/SPEC.md` | The technical specification: data model, time model, calendar model, storage layout, pipeline contracts, validation rules and the backtest caveats |
-| `PLAN.md` | Requirements and roadmap |
-| `market_data/` | The exports, with the naming conventions and the known gap |
-| `tools/` | The pipeline and the verification tools — `pip install pandas pyarrow duckdb` |
+| [`docs/SPEC.md`](docs/SPEC.md) | The technical specification: data model, time model, calendar model, storage layout, pipeline contracts, validation rules and the backtest caveats |
+| [`PLAN.md`](PLAN.md) | Requirements and roadmap |
+| [`market_data/`](market_data/) | The exports, with the naming conventions and the known gap |
+| [`tools/`](tools/) | The pipeline and the verification tools — see [tools/README.md](tools/README.md) |
 
 | Tool | |
 |---|---|
