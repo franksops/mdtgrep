@@ -1,0 +1,15 @@
+key,value
+symbol,ESZ16_FUT_CME
+export_mode,bars
+timestamp_basis,Chart Local
+acsil_interface_version,2969
+bar_period_type,Days-Mins-Secs-Milliseconds
+bar_period_parameter1,60
+bar_period_parameter2,0
+is_range_bars,0
+rows,90619
+first_ts_ms,1473631200000
+last_ts_ms,1481673540000
+first_trading_day,2016-09-12
+last_trading_day,2016-12-14
+exported_at_utc,2026-11-22 21:40:40

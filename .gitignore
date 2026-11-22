@@ -1,24 +1,15 @@
-# Exported market data is never committed - it is large and reproducible
-# from the study. The folder itself is kept (with its README) so the
-# convention is documented.  The pattern covers sub folders as well.
-market_data/*.csv
-market_data/*.csv.gz
-market_data/*.parquet
-market_data/*.zst
-market_data/*.json
-market_data/*.db
-market_data/*.sqlite*
-market_data/**/*.csv
-market_data/**/*.csv.gz
-market_data/**/*.parquet
-market_data/**/*.zst
-market_data/**/*.json
-market_data/**/*.db
-market_data/**/*.sqlite*
+# Derived data - regenerate with the pipeline, never commit it.
+data/
+*.duckdb
+*.duckdb.wal
 
 # Raw Sierra Chart data files
 *.scid
 *.scd
+
+# The bulk collection (10+ years of exports) goes here and is not committed.
+# Only the reviewed sample under market_data/bars_1m is tracked.
+market_data/collections/
 
 # Python
 __pycache__/

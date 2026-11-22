@@ -324,9 +324,68 @@ different:
 
 ---
 
+## The data lake
+
+The exports are the immutable landing zone; everything else is derived from them.
+
+```bash
+# 1  ingest: CSV -> validated Parquet (idempotent, one run per changed file)
+python tools/build_parquet.py --source market_data --out data/parquet --reports data/reports
+
+# 2  the catalogue: sessions, gaps, instruments, calendar and the views
+python tools/init_duckdb.py --parquet data/parquet --tables data/tables \
+    --reports data/reports --db data/market.duckdb
+```
+
+Then query it:
+
+```sql
+-- duckdb data/market.duckdb
+SELECT symbol, trading_day, bars, volume, close FROM bars_1m_by_day
+WHERE symbol = 'ESZ16_FUT_CME' AND trading_day BETWEEN '2016-12-01' AND '2016-12-31';
+
+SELECT * FROM data_gaps;
+```
+
+The ingest validates every file and writes a JSON report; it exits non-zero when a rule fails.
+The rules, the schema, the calendar model and the backtest caveats are in
+**[docs/SPEC.md](docs/SPEC.md)**.
+
 ## Tools
 
-All tools are plain Python with `pandas` (`pip install pandas pyarrow`).
+All tools are plain Python with `pandas`, `pyarrow` and `duckdb`
+(`pip install pandas pyarrow duckdb`).
+
+### `tools/build_parquet.py` — the ingest
+
+```bash
+python tools/build_parquet.py --source market_data --out data/parquet --reports data/reports
+```
+
+Reads every export, normalises the schema (deriving `trading_day` for exports made before the
+column existed), validates the invariants, derives the session and gap tables and writes
+partitioned Parquet (`symbol=/year=`). Idempotent: a file is fingerprinted and skipped when it
+has not changed. When the same series exists more than once the newest export wins.
+
+### `tools/init_duckdb.py` — the catalogue
+
+```bash
+python tools/init_duckdb.py --parquet data/parquet --tables data/tables \
+    --reports data/reports --db data/market.duckdb
+```
+
+Creates the catalogue tables (`instruments`, `sessions`, `data_gaps`, `rolls`, `exports`,
+`trading_calendar`, `file_reports`) and the views over the Parquet lake (`bars_1m`, `trades`,
+`bars_1m_by_day`, `trades_by_day`). The bulk data is never copied into the database.
+
+### `tools/cme_calendar.py` — the CME holiday rules
+
+The holiday and early close rules of the CME equity index complex, derived from the exported
+data. Used by the ingest to tell a scheduled early close apart from a real data gap.
+
+```bash
+python tools/cme_calendar.py 2017
+```
 
 ### `tools/validate_export.py` — structural checks on any export
 
@@ -492,10 +551,17 @@ See [Build and the interface version](#build-and-the-interface-version).
 MDTGrep.cpp                      the ACSIL study
 README.md                        this document
 PLAN.md                          requirements and roadmap
+docs/SPEC.md                     the technical specification of the data lake
+tools/build_parquet.py           ingest: CSV -> validated Parquet
+tools/init_duckdb.py             the DuckDB catalogue and the views over the lake
 tools/validate_export.py         structural validation of an export
 tools/verify_vs_databento.py     tick level comparison against Databento
 tools/fix_prev_version_data.py   repair of exports made with the older study
-market_data/                     exported CSV files
+tools/cme_calendar.py            the CME equity index holiday calendar
+tools/instruments.csv            the contract specifications
+market_data/bars_1m/             the reviewed exports (the current schema)
+market_data/legacy_bars/         exports made before the trading_day column
+data/                            the derived lake (Parquet, catalogue, reports) - not committed
 defunct/                         earlier versions of the exporter, kept for reference
 ```
 
