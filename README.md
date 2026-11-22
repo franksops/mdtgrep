@@ -278,7 +278,7 @@ exchange feed, and prices and sizes should line up trade for trade. What differs
 | Price | raw traded price | raw traded price | none — the **bar** file is chart back adjusted, the trade file is not |
 | Size | integer | integer | none |
 | Side | exchange reported | derived from the quotes, otherwise the volume split | Mid-tick trades can be `N` here and `B`/`S` there |
-| Cancels / corrections | `action` = `C` / `X` | not provided | Databento can contain fewer trades for the same session |
+| Cancels / corrections | not in the `trades` schema (`action` is always `T`); they live in `mbo` | not provided | A strategy that reacts to cancellations needs Databento's MBO schema, which this pipeline does not provide |
 | Book depth (MBP-1 / MBO) | up to 10 price levels | not available | Depth based strategies cannot be reproduced from this feed |
 | Aggregation | one message per trade | one record per trade, when the storage unit is 1 Tick | `num_trades` reports it per row |
 
@@ -292,7 +292,16 @@ python tools/verify_vs_databento.py \
 
 It reports the trade count difference, the timestamp alignment within a tolerance, the price and
 size agreement, the side agreement with a confusion matrix and examples of unmatched trades on
-both sides. Acceptance criteria for a trade level export:
+both sides. Databento's side is named after the passive side of the book (`A` = sell aggressor,
+`B` = buy aggressor, `N` = unspecified) and is translated to the MDTGrep convention before the
+comparison.
+
+**Compare a recent period.** Databento's CME data before 2017-05-21 comes from the legacy
+aggregated FIX protocol, where the aggressor side is frequently missing, and the historical
+dataset is normalised retroactively by the vendor. A current session gives a meaningful side
+comparison; an old one mostly measures the vendor's legacy coverage.
+
+Acceptance criteria for a trade level export:
 
 | Metric | Target |
 |---|---|

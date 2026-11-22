@@ -36,6 +36,12 @@ import argparse
 import sys
 from pathlib import Path
 
+# Databento names the side after the passive side of the book: 'A' means the
+# aggressor was a seller, 'B' means the aggressor was a buyer and 'N' means no
+# side was specified.  MDTGrep names it after the aggressor: 'B' buy, 'S' sell,
+# 'N' unknown.  The comparison is done in the MDTGrep convention.
+DATABENTO_SIDE_TO_OURS = {"A": "S", "B": "B", "N": "N"}
+
 try:
     import pandas as pd
 except ImportError:  # pragma: no cover
@@ -101,6 +107,12 @@ def load_databento(path: Path, tolerance_ms: int) -> pd.DataFrame:
 
     if "side" not in trades.columns:
         trades["side"] = "N"
+    else:
+        trades["side"] = (
+            trades["side"].astype(str).str.strip().str.upper()
+            .map(DATABENTO_SIDE_TO_OURS)
+            .fillna("N")
+        )
 
     return trades.sort_values("ts_ms").reset_index(drop=True)
 
@@ -220,6 +232,8 @@ def compare(sierra: pd.DataFrame, db: pd.DataFrame, tolerance_ms: int, price_tol
     print()
     print("Side")
     print(f"  Exact match           : {side_same:>12,}  ({100.0 * side_same / len(matched):.3f}%)")
+    print("  (Databento 'A' = sell aggressor, 'B' = buy aggressor, 'N' = unspecified,")
+    print("   mapped to the MDTGrep convention S/B/N before the comparison)")
 
     print()
     print("  Confusion matrix (Sierra rows / Databento columns)")
