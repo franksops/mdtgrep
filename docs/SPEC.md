@@ -100,7 +100,8 @@ ask             double   ask price at the moment of the trade, 0 when not suppli
     trades, not the exchange reported aggressor side. A trade that happened between the bid
     and the ask is classified by the uptick/downtick rule. The `side` column uses the exchange
     rule (a trade at or above the ask is a buy) when the record carries the quotes, and falls
-    back to the volume split otherwise.
+    back to the volume split otherwise. Databento's `side` is named the other way round
+    (`A` = sell aggressor, `B` = buy aggressor, `N` = unspecified).
 *   **The bar timestamp** is the *start* of the bar. The session open bar is labelled with the
     session open, so a bar at 18:00 Eastern covers 18:00–18:00:59.
 *   **A trade is not a bar** — a 1 minute bar aggregates every trade of that minute. The
@@ -339,7 +340,10 @@ These follow from the data model and have to be respected by any strategy built 
    Use a conservative fill: a stop fills at the stop price, not at the bar's close.
 2. **The buy/sell split is derived, not exchange reported.** Sierra Chart classifies a trade
    between the bid and the ask by the uptick/downtick rule. A strategy that depends on the
-   exchange's aggressor side will not match Databento exactly on mid-tick trades.
+   exchange's aggressor side will not match Databento exactly on mid-tick trades. The naming
+   also differs: Databento names the side after the passive side of the book (`A` = sell
+   aggressor, `B` = buy aggressor, `N` = unspecified), MDTGrep after the aggressor (`S`, `B`,
+   `N`).
 3. **Milliseconds, not nanoseconds.** Sierra Chart's timestamps are millisecond resolution. Two
    trades in the same millisecond cannot be separated by time — the file order is the only
    sequence information.
