@@ -282,7 +282,20 @@ exchange feed, and prices and sizes should line up trade for trade. What differs
 | Book depth (MBP-1 / MBO) | up to 10 price levels | not available | Depth based strategies cannot be reproduced from this feed |
 | Aggregation | one message per trade | one record per trade, when the storage unit is 1 Tick | `num_trades` reports it per row |
 
-`tools/verify_vs_databento.py` measures the difference rather than assuming it:
+`tools/fetch_databento.py` fetches the same session from Databento and runs the comparison in one
+command. It derives the CME session window from the trading day, so the range covers the session
+from the previous evening's open at 18:00 Eastern to the close at 17:00 Eastern, following
+daylight saving time:
+
+```bash
+export DATABENTO_API_KEY=db-XXXXXXXX
+
+python tools/fetch_databento.py --symbol ESH6 --session-date 2026-11-18 \
+    --compare market_data/bars_1m/ESH6_bars_ticks.csv
+```
+
+`tools/verify_vs_databento.py` measures the difference rather than assuming it, and works with any
+Databento file:
 
 ```bash
 python tools/verify_vs_databento.py \
@@ -403,6 +416,16 @@ Log messages that explain an empty or partial result:
 | `PLAN.md` | Requirements and roadmap |
 | `market_data/` | The exports, with the naming conventions and the known gap |
 | `tools/` | The pipeline and the verification tools — `pip install pandas pyarrow duckdb` |
+
+| Tool | |
+|---|---|
+| `build_parquet.py` | The ingest: CSV → validated Parquet |
+| `init_duckdb.py` | The catalogue and the views over the lake |
+| `validate_export.py` | Structural validation of an export |
+| `fetch_databento.py` | Fetch a Databento session and compare it |
+| `verify_vs_databento.py` | Trade level comparison against another vendor |
+| `fix_prev_version_data.py` | Repair of exports made with the older study |
+| `cme_calendar.py` | The CME equity index holiday calendar |
 
 **Roadmap**
 
