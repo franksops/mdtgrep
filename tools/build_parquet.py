@@ -382,21 +382,40 @@ def main() -> None:
     # One series per file stem (the symbol plus the suffix of the study
     # input).  When the same series exists more than once - for example after
     # a re-export - the newest one wins, so the lake never holds duplicates.
-    candidates: dict[str, tuple[Path, str, float]] = {}
+    #
+    # The export time of the metadata sidecar is the authoritative timestamp.
+    # The file modification time is only a fallback, because a checkout
+    # rewrites all the modification times and they would then say nothing
+    # about which export is the newer one.
+    candidates: dict[str, tuple[Path, float, bool]] = {}
 
     for path in files:
         meta = read_meta(path)
         exported = meta.get("exported_at_utc")
-        stamp = path.stat().st_mtime
+        stamp = None
+
         if exported:
             try:
                 stamp = datetime.strptime(str(exported), "%Y-%m-%d %H:%M:%S").replace(
                     tzinfo=timezone.utc).timestamp()
             except ValueError:
-                pass
+                stamp = None
+
+        has_stamp = stamp is not None
+        if stamp is None:
+            stamp = path.stat().st_mtime
+
         series = path.stem
-        if series not in candidates or stamp > candidates[series][2]:
-            candidates[series] = (path, str(exported or ""), stamp)
+        current = candidates.get(series)
+
+        if current is None:
+            candidates[series] = (path, stamp, has_stamp)
+        elif has_stamp != current[2]:
+            # An export with a known export time always wins over one without.
+            if has_stamp:
+                candidates[series] = (path, stamp, has_stamp)
+        elif stamp > current[1]:
+            candidates[series] = (path, stamp, has_stamp)
 
     selected = sorted(candidates.values(), key=lambda t: t[0].as_posix())
     superseded = len(files) - len(selected)
@@ -410,7 +429,7 @@ def main() -> None:
     skipped = 0
     failed = 0
 
-    for path, _exported_at, _stamp in selected:
+    for path, _stamp, _has_stamp in selected:
         rel = str(path.relative_to(args.source))
 
         fingerprint = file_fingerprint(path)
