@@ -52,8 +52,8 @@ output. Do **not** use `Range Per Bar` here: that produces price-movement bars, 
 `Edit` → `Recalculate` on the chart. The log confirms what happened:
 
 ```
-MDTGrep: ACSIL interface 2217 - exported 89265 bars to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars.csv (UTC)
-MDTGrep: ACSIL interface 2217 - exported 240318 ticks to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars_ticks.csv (UTC)
+MDTGrep: ACSIL interface 2969 - exported 90619 bars to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars.csv (chart local time)
+MDTGrep: ACSIL interface 2969 - exported 240318 ticks to C:\SierraChart\SCAssistData\ESZ16_FUT_CME_bars_ticks.csv (chart local time)
 ```
 
 ### 5. Verify
@@ -76,9 +76,11 @@ build and **silently refuses to run a study whose DLL does not match**:
 That is why a study built against a stale `ACS_Source\sierrachart.h` compiles with **zero errors**
 and still never runs. The rules:
 
-*   Sierra Chart **2972 and higher** finalized the internal double precision number project, so
-    every custom study has to be recompiled for that version. Interface version `2217` corresponds
-    to it.
+*   The interface version tracks the Sierra Chart build that introduced the change, so it has to
+    match the running build. Sierra Chart **2972 and higher** finalized the internal double
+    precision number project, which is why every custom study has to be recompiled for that
+    version. A build made against an older header reports the older version (`SC_DLL_VERSION` in
+    `sierrachart.h`) and is rejected.
 *   **Build Remote** always compiles against the header of the running Sierra Chart build. A local
     build uses whatever `ACS_Source\sierrachart.h` happens to be.
 *   MDTGrep logs the interface version it was built with on every export. **If that line is missing
@@ -87,7 +89,7 @@ and still never runs. The rules:
     removed and re-added), and the export has to be triggered with `Edit → Recalculate`.
 
 MDTGrep also emits a `#pragma message` at compile time when it is built against an interface older
-than 2217, so a stale local build is visible in the build log.
+than `2969`, so a stale local build is visible in the build log.
 
 ---
 
@@ -164,8 +166,10 @@ Every export also writes `<file>_meta.csv` next to the data file:
 key,value
 symbol,ESH17_FUT_CME
 export_mode,bars
-timestamp_basis,UTC
-acsil_interface_version,2217
+timestamp_basis,Chart Local
+chart_time_zone_is_utc,1
+timestamps_are_utc,1
+acsil_interface_version,2969
 bar_period_type,Days-Mins-Secs-Milliseconds
 bar_period_parameter1,60
 is_range_bars,0
@@ -181,6 +185,10 @@ It records the settings that produced the file. The chart time zone and the sess
 visible in the data itself, so they have to be captured when the file is written — without this a
 collection of 40+ contracts cannot be audited after the fact. `is_range_bars` is 1 when the chart
 was set to a price-movement bar period, which produces bars that are not time based.
+
+`timestamps_are_utc` is the row the load pipeline should assert on: it is 1 when the timestamps in
+the file are true UTC instants, which is the case when `Timestamp Basis` is `UTC` or when the
+chart time zone is UTC. The study logs a warning when it is 0.
 
 ---
 

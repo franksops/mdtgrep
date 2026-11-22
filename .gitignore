@@ -1,6 +1,6 @@
 # Exported market data is never committed - it is large and reproducible
 # from the study. The folder itself is kept (with its README) so the
-# convention is documented.
+# convention is documented.  The pattern covers sub folders as well.
 market_data/*.csv
 market_data/*.csv.gz
 market_data/*.parquet
@@ -8,6 +8,13 @@ market_data/*.zst
 market_data/*.json
 market_data/*.db
 market_data/*.sqlite*
+market_data/**/*.csv
+market_data/**/*.csv.gz
+market_data/**/*.parquet
+market_data/**/*.zst
+market_data/**/*.json
+market_data/**/*.db
+market_data/**/*.sqlite*
 
 # Raw Sierra Chart data files
 *.scid

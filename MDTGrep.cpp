@@ -53,16 +53,16 @@ SCDLLName("MDTGrep")
 // precision number project).  Analysis >> Build Custom Studies DLL >>
 // "Build Remote" always compiles against the header of the running Sierra
 // Chart build.  The interface version that was compiled in is written to the
-// log with every export so it can be verified.
+// log with every export and into the metadata sidecar, so it can always be
+// verified.
 // ---------------------------------------------------------------------------
 #if !defined(SC_DLL_VERSION)
 	#error "MDTGrep.cpp requires a current sierrachart.h (ACSIL) header."
 #endif
 
-#if SC_DLL_VERSION < 2217
-	#pragma message("MDTGrep: WARNING - ACSIL interface version is older than 2217 (Sierra Chart 2972+). Build with 'Build Remote' or update ACS_Source\\sierrachart.h, otherwise Sierra Chart will not run this DLL.")
+#if SC_DLL_VERSION < 2969
+	#pragma message("MDTGrep: WARNING - built against an ACSIL interface older than 2969. Use 'Build Remote' or update ACS_Source\\sierrachart.h, otherwise Sierra Chart will refuse to run this DLL.")
 #endif
-
 #define OUTPUT_DIR_DEFAULT "C:\\SierraChart\\SCAssistData\\"
 
 // Export Mode (input 2)
@@ -482,6 +482,22 @@ static void WriteManifest(SCStudyInterfaceRef sc, const SCString& DataFilePath, 
 	n_ACSIL::s_BarPeriod BarPeriod;
 	sc.GetBarPeriodParameters(BarPeriod);
 
+	// The time zone of the chart cannot be read through the ACSIL interface,
+	// but it can be verified: converting a date/time to UTC leaves it
+	// unchanged only when the chart is on UTC.  The ETL needs to know whether
+	// the timestamps of the file are true UTC instants.
+	bool bChartIsUtc = false;
+
+	if (sc.ArraySize > 0)
+	{
+		const SCDateTime& Probe = sc.BaseDateTimeIn[0];
+		const SCDateTimeMS AsUtc = sc.ConvertDateTimeFromChartTimeZone(Probe, TIMEZONE_UTC);
+
+		bChartIsUtc = (AsUtc.GetAsDouble() == Probe.GetAsDouble());
+	}
+
+	const bool bTimestampsAreUtc = bUtc || bChartIsUtc;
+
 	int Year = 0, Month = 0, Day = 0, Hour = 0, Minute = 0, Second = 0;
 	sc.GetCurrentDateTime().GetDateTimeYMDHMS(Year, Month, Day, Hour, Minute, Second);
 
@@ -492,6 +508,8 @@ static void WriteManifest(SCStudyInterfaceRef sc, const SCString& DataFilePath, 
 	OutFile << "symbol," << sc.Symbol.GetChars() << "\n";
 	OutFile << "export_mode," << ExportMode.GetChars() << "\n";
 	OutFile << "timestamp_basis," << (bUtc ? "UTC" : "Chart Local") << "\n";
+	OutFile << "chart_time_zone_is_utc," << (bChartIsUtc ? 1 : 0) << "\n";
+	OutFile << "timestamps_are_utc," << (bTimestampsAreUtc ? 1 : 0) << "\n";
 	OutFile << "acsil_interface_version," << SC_DLL_VERSION << "\n";
 	OutFile << "bar_period_type," << GetBarPeriodTypeName(BarPeriod) << "\n";
 	OutFile << "bar_period_parameter1," << BarPeriod.IntradayChartBarPeriodParameter1 << "\n";
@@ -505,6 +523,13 @@ static void WriteManifest(SCStudyInterfaceRef sc, const SCString& DataFilePath, 
 	OutFile << "exported_at_utc," << ExportedAt.GetChars() << "\n";
 
 	OutFile.close();
+
+	if (!bTimestampsAreUtc)
+	{
+		SCString Msg;
+		Msg.Format("MDTGrep: the timestamps of %s are NOT true UTC. The chart time zone is not UTC and Timestamp Basis is 'Chart Local'. Set Timestamp Basis to UTC or set the chart time zone to UTC.", DataFilePath.GetChars());
+		sc.AddMessageToLog(Msg, 1);
+	}
 }
 
 // ---------------------------------------------------------------------------
