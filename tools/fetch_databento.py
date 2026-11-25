@@ -68,9 +68,46 @@ def session_window(session_date: str) -> tuple[datetime, datetime]:
     return open_et.astimezone(timezone.utc), close_et.astimezone(timezone.utc)
 
 
+def list_es_contracts(client, dataset: str, session_date: str) -> None:
+    """Print the ES contracts that exist for a session, with their expiries.
+
+    Used when the symbol given on the command line does not resolve - the
+    exchange changed its symbol convention for some products, so the year
+    digit can differ from the one expected.
+    """
+    day = datetime.strptime(session_date, "%Y-%m-%d").date()
+
+    try:
+        store = client.timeseries.get_range(
+            dataset=dataset,
+            start=day,
+            end=day + timedelta(days=1),
+            schema="definition",
+        )
+        defs = store.to_df()
+    except Exception as e:  # pragma: no cover
+        print(f"could not read the definitions: {e}")
+        return
+
+    if defs.empty:
+        print("no definitions returned")
+        return
+
+    mask = defs.get("raw_symbol", pd.Series(dtype=str)).astype(str).str.startswith("ES")
+    rows = defs[mask]
+
+    print(f"\n  ES contracts listed for {day}:")
+    cols = [c for c in ("raw_symbol", "expiration_date", "contract_multiplier",
+                        "min_price_increment", "underlying") if c in rows.columns]
+    for _, r in rows.sort_values("expiration_date").iterrows():
+        exp = r.get("expiration_date", "")
+        print(f"    {r['raw_symbol']:<8} expires {exp}   multiplier {r.get('contract_multiplier','')}"
+              f"   tick {r.get('min_price_increment','')}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch a Databento trade session.")
-    parser.add_argument("--symbol", required=True, help="the raw contract symbol, e.g. ESH6")
+    parser.add_argument("--symbol", required=True, help="the raw contract symbol, e.g. ESZ6")
     parser.add_argument("--session-date", required=True, help="the trading day, YYYY-MM-DD")
     parser.add_argument("--dataset", default="GLBX.MDP3")
     parser.add_argument("--schema", default="trades")
@@ -106,7 +143,11 @@ def main() -> None:
     df = store.to_df()
 
     if df.empty:
-        sys.exit("no data returned - check the symbol, the date and the dataset")
+        print()
+        print(f"no data for '{args.symbol}' on {args.session_date}.")
+        print("The symbol may be wrong - the exchange changed its year digit for some contracts.")
+        list_es_contracts(client, args.dataset, args.session_date)
+        sys.exit(2)
 
     # The DBN price is an integer scaled by 1e-9.
     if "price" in df.columns and pd.api.types.is_integer_dtype(df["price"]):
