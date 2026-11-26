@@ -21,7 +21,7 @@ The price, volume and trade count columns are passed through unchanged.
 
 Usage
 -----
-    python tools/fix_prev_version_data.py prev_version_data/*.csv
+    python tools/fix_prev_version_data.py market_data/legacy_bars/*.csv --source-tz America/New_York
     python tools/fix_prev_version_data.py --keep-open-interest --source-tz America/Chicago in.csv
 """
 

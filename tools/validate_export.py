@@ -16,7 +16,7 @@ or the tick export:
 Usage
 -----
     python tools/validate_export.py C:/SierraChart/SCAssistData/ESM6_bars.csv
-    python tools/validate_export.py prev_version_data/*.csv --source-tz America/New_York
+    python tools/validate_export.py market_data/legacy_bars/*.csv --source-tz America/New_York
     python tools/validate_export.py *_ticks.csv --kind ticks
 """
 
